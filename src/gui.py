@@ -159,32 +159,19 @@ class MojiOkoshiGUI:
         if not scene_title:
             messagebox.showwarning("警告", "シーン名が空です。シーン名を入力してください。")
             return
-        current_scene = None
-        current_scene_text = self.current_scene_label.cget("text")
-        if current_scene_text.startswith("現在のシーン: "):
-            current_scene = current_scene_text.replace("現在のシーン: ", "").strip()
-        # Check for duplicate using MojiOkoshi's method
-        if hasattr(self.mojiokoshi, "scene_name_exists"):
-            is_dup = self.mojiokoshi.scene_name_exists(scene_title, exclude=current_scene)
-        else:
-            # fallback (legacy) check
-            is_dup = hasattr(self.mojiokoshi, "scene_transcriptions") and scene_title in self.mojiokoshi.scene_transcriptions and scene_title != current_scene
-        if is_dup:
-            # Button should already be disabled, but double-check and show warning
-            self.switch_scene_button.config(state="disabled")
-            # Show warning label below the entry (in addition to messagebox)
-            if hasattr(self, "_scene_warning_label") and self._scene_warning_label.winfo_exists():
-                self._scene_warning_label.destroy()
-            self._scene_warning_label = tk.Label(self.root, text=f"シーン名「{scene_title}」は既に存在します。", fg="red", font=("Arial", 10, "bold"))
-            self._scene_warning_label.grid(row=0, column=1, padx=5, pady=(28,0), sticky="sw")
+
+        # MojiOkoshiのswitch_sceneメソッドを呼び出す
+        # 戻り値がFalseなら、重複などの理由で失敗したと判断
+        if not self.mojiokoshi.switch_scene(scene_title):
+            # ボタンの状態を更新すると、GUI上の重複警告が表示されます
+            self.update_switch_scene_button_state()
             messagebox.showwarning("警告", f"シーン名「{scene_title}」は既に存在します。別の名前を入力してください。")
             return
-        # Only switch scene if name is unique or matches current scene
-        self.mojiokoshi.switch_scene(scene_title)
-        if hasattr(self.mojiokoshi, "scene_transcriptions"):
-            self.mojiokoshi.scenes = dict(self.mojiokoshi.scene_transcriptions)
-        # Only add to history if not already present (add_scene_to_history will enforce this)
+
+        # シーン切り替えが成功した場合のみ、UIの更新を行う
+        # 1. シーン履歴に新しいシーンを追加
         self.add_scene_to_history(scene_title)
+        # 2. ボタンの状態を更新
         self.update_switch_scene_button_state()
 
     def start_recording(self):
