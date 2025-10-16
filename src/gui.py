@@ -29,8 +29,8 @@ class MojiOkoshiGUI:
 
         # Start recording button
         self.start_button = tk.Button(self.root, text="録音開始", command=self.start_recording,
-                                     bg="#4CAF50", fg="black",
-                                     activebackground="#45a049", activeforeground="black")
+                                        bg="#4CAF50", fg="black",
+                                        activebackground="#45a049", activeforeground="black")
         self.start_button.grid(row=1, column=0, padx=5, pady=5)
 
         # Stop recording and save all scenes button
@@ -50,7 +50,7 @@ class MojiOkoshiGUI:
 
         # Current scene display
         self.current_scene_label = tk.Label(self.root, text="現在のシーン: 未設定", 
-                                           font=("Arial", 14), fg="blue")
+                                            font=("Arial", 14), fg="blue")
         self.current_scene_label.grid(row=4, column=0, columnspan=3, padx=5, pady=(10, 5), sticky="w")
         
         # Scene history display
@@ -62,8 +62,8 @@ class MojiOkoshiGUI:
         self.scene_history_frame.grid(row=6, column=0, columnspan=3, padx=5, pady=5, sticky="ew")
         
         self.scene_history_listbox = tk.Listbox(self.scene_history_frame, height=6, width=50, 
-                                               font=("Arial", 12), selectbackground="#4CAF50", 
-                                               selectforeground="white")
+                                                font=("Arial", 12), selectbackground="#4CAF50", 
+                                                selectforeground="white")
         self.scene_history_scrollbar = tk.Scrollbar(self.scene_history_frame, orient="vertical")
         self.scene_history_listbox.config(yscrollcommand=self.scene_history_scrollbar.set)
         self.scene_history_scrollbar.config(command=self.scene_history_listbox.yview)
@@ -179,7 +179,7 @@ class MojiOkoshiGUI:
             self.is_recording = True
             # ボタンの見た目を変更（録音中状態）
             self.start_button.config(text="● REC", bg="#E91E63", fg="red", 
-                                   activebackground="#cc0000", activeforeground="black")
+                                    activebackground="#cc0000", activeforeground="black")
             self.stop_button.config(state="normal")
             
             # Start the MojiOkoshi recording in a separate thread
@@ -239,8 +239,8 @@ class MojiOkoshiGUI:
         """文字起こし処理の完了を待機"""
         #print("DEBUG: 文字起こし完了待機開始")
         while (self.mojiokoshi.audio_queue.qsize() > 0 or 
-               len(self.mojiokoshi.partial_audio_buffer) > 0 or
-               self.mojiokoshi.processing_progress['current_stage'] == 'transcribing'):
+                len(self.mojiokoshi.partial_audio_buffer) > 0 or
+                self.mojiokoshi.processing_progress['current_stage'] == 'transcribing'):
             
             # 進行状況を取得
             progress = self.mojiokoshi.get_progress_percentage()
@@ -318,10 +318,10 @@ class MojiOkoshiGUI:
         """UIをリセット"""
         # 録音開始ボタンを元の状態に戻す
         self.start_button.config(text="録音開始", bg="#4CAF50", fg="black",
-                               activebackground="#45a049", activeforeground="black")
+                                activebackground="#45a049", activeforeground="black")
         # 録音停止ボタンを元の状態に戻す
         self.stop_button.config(state="normal", text="録音停止", bg="#f44336", fg="black",
-                              activebackground="#da190b", activeforeground="black")
+                                activebackground="#da190b", activeforeground="black")
         self.is_recording = False
 
     def update_progress(self):
