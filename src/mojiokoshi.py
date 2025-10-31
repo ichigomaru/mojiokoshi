@@ -4,7 +4,6 @@ import whisper
 import librosa
 import threading
 import queue
-import time
 import os
 import tkinter as tk
 from tkinter import messagebox
@@ -14,10 +13,11 @@ RECORD_SEC = 5            # 5秒ごとの分割録音
 BUFFER_SEC = 60           # 60秒分貯まったらキューに送る
 SAMPLE_RATE = 48000       # 録音時サンプルレート
 TARGET_SR = 16000         # Whisper用サンプルレート
-NUM_CHANNEL = 3 
+NUM_CHANNEL = 3
 VOLUME = 1.3
 MODEL_SIZE = "medium"     # whisperモデルサイズ
 SD_DEVICE = "mojiokoshi"  # spot検索、オーディオデバイスの設定から変更可能
+LANGUAGE = "ja"          # Whisperの言語設定（例: "ja"、"en"）
 
 class MojiOkoshi:
     def __init__(self):
@@ -108,7 +108,7 @@ class MojiOkoshi:
                     # Whisperで文字起こし
                     #print(f"Whisper処理開始 ({processed_index} / {total_queue})")
                     try:
-                        result = self.model.transcribe(resampled, language="ja")
+                        result = self.model.transcribe(resampled, language=LANGUAGE)
                         text = result["text"]
                         print(text)
                         self.text_results.append(text)
@@ -414,7 +414,7 @@ class MojiOkoshi:
                 resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
                 resampled = np.clip(resampled * 1.3, -1.0, 1.0)
                 try:
-                    result = self.model.transcribe(resampled, language="ja")
+                    result = self.model.transcribe(resampled, language=LANGUAGE)
                     text = result["text"]
                     self.add_transcription(text)
                 except Exception as e:
@@ -431,7 +431,7 @@ class MojiOkoshi:
                     resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
                     resampled = np.clip(resampled * 1.3, -1.0, 1.0)
                     try:
-                        result = self.model.transcribe(resampled, language="ja")
+                        result = self.model.transcribe(resampled, language=LANGUAGE)
                         text = result["text"]
                         self.add_transcription(text)
                     except Exception as e:
@@ -452,7 +452,7 @@ class MojiOkoshi:
                 if mono.size > 0:
                     resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
                     resampled = np.clip(resampled * 1.3, -1.0, 1.0)
-                    result = self.model.transcribe(resampled, language="ja")
+                    result = self.model.transcribe(resampled, language=LANGUAGE)
                     texts_to_add.append(result["text"])
             except Exception as e:
                 texts_to_add.append(f"[文字起こしエラー: {str(e)[:50]}...]")
@@ -465,7 +465,7 @@ class MojiOkoshi:
                 if mono.size > 0:
                     resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
                     resampled = np.clip(resampled * 1.3, -1.0, 1.0)
-                    result = self.model.transcribe(resampled, language="ja")
+                    result = self.model.transcribe(resampled, language=LANGUAGE)
                     texts_to_add.append(result["text"])
             except Exception as e:
                 texts_to_add.append(f"[文字起こしエラー: {str(e)[:50]}...]")
