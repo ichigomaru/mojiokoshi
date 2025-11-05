@@ -7,11 +7,14 @@ import queue
 import os
 import tkinter as tk
 from tkinter import messagebox
+import datetime  # <-- 追加
+import soundfile as sf  # <-- 追加
+# pydubのインポートは不要
 
 # ----- 設定項目 -----
 RECORD_SEC = 5            # 5秒ごとの分割録音
 BUFFER_SEC = 60           # 60秒分貯まったらキューに送る
-SAMPLE_RATE = 48000       # 録音時サンプルレート
+SAMPLE_RATE = 16000       # 録音時サンプルレート
 TARGET_SR = 16000         # Whisper用サンプルレート
 NUM_CHANNEL = 3
 VOLUME = 1.3
@@ -34,6 +37,12 @@ class MojiOkoshi:
         self.transcription_lock = threading.Lock() 
         self.scenes = {}
         
+        # 録音データ保存用の設定
+        self.voice_log_dir = os.path.join("log", "voice")
+        os.makedirs(self.voice_log_dir, exist_ok=True)
+        self.wav_writer = None
+        self.current_wav_path = None
+        
         
         # 未完成の録音ブロックを保持するバッファ
         self.partial_audio_buffer = []
@@ -53,6 +62,26 @@ class MojiOkoshi:
             return
         if status:
             print(f"audio_callback status: {status}")
+            
+        # 録音データをWAVファイルに書き込む
+        try:
+            if self.wav_writer:
+                # indata は (frames, 3) の形状
+                
+                # Ch 0: マイク音声 (そのまま)
+                mic_channel = indata[:, 0]
+                
+                # Ch 1, 2: 仮想L, 仮想R を平均化してモノラルに
+                virtual_mono = np.mean(indata[:, 1:3], axis=1)
+                
+                # 2チャンネルのNumpy配列を作成
+                output_data = np.stack((mic_channel, virtual_mono), axis=1)
+                
+                # 2チャンネルのデータをWAVに書き込む
+                self.wav_writer.write(output_data)
+        except Exception as e:
+            print(f"WAVファイルへの書き込みエラー: {e}")
+            
         #print(f" データサイズ: {indata.shape}, フレーム数: {frames}")
         
         # データをバッファに追加
@@ -134,67 +163,102 @@ class MojiOkoshi:
     def start(self):
         #print("DEBUG: start()メソッド開始")
         
-        # 利用可能なオーディオデバイスを表示
-        #print("DEBUG: 利用可能なオーディオデバイス:")
-        # devices = sd.query_devices()
-        # for i, device in enumerate(devices):
-        #     print(f"  {i}: {device['name']} (入力: {device['max_input_channels']}, 出力: {device['max_output_channels']})")
-        
         try:
-            sd.default.device = SD_DEVICE  # BlackHole + マイクの複合デバイス名
+            sd.default.device = SD_DEVICE
             sd.default.samplerate = SAMPLE_RATE
-            sd.default.channels = NUM_CHANNEL  # モノラル録音
-            #print(f"DEBUG: 録音設定 - デバイス: {SD_DEVICE}, サンプルレート: {SAMPLE_RATE}, チャンネル: {NUM_CHANNEL}")
+            sd.default.channels = NUM_CHANNEL
 
-            # バッファサイズは1秒分のフレーム数
+            # 録音ファイルの設定
+            try:
+                now = datetime.datetime.now()
+                timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")
+                filename = now.strftime("%Y-%m-%d_%H-%M-%S") + ".wav"
+                self.current_wav_path = os.path.join(self.voice_log_dir, filename)
+                
+                # 保存するWAVファイルは 2 チャンネルで作成
+                self.wav_writer = sf.SoundFile(
+                    self.current_wav_path, 
+                    mode='w', 
+                    samplerate=SAMPLE_RATE, # 16000
+                    channels=2              # 2チャンネル (Mic, Virtual Mono)
+                )
+                print(f"録音データを {self.current_wav_path} に (2ch, 16kHzで) 保存開始...")
+            except Exception as e:
+                print(f"録音ファイルの作成に失敗しました: {e}")
+                self.wav_writer = None
+
+            try:
+                text_filename = timestamp_str + ".txt"
+                self.current_text_log_path = os.path.join(self.other_log_dir, text_filename)
+                with open(self.current_text_log_path, "w", encoding="utf-8") as f:
+                    f.write(f"--- 録音開始: {timestamp_str} ---\n")
+                print(f"即時ログを {self.current_text_log_path} に保存開始...")
+            except Exception as e:
+                print(f"即時ログファイルの作成に失敗しました: {e}")
+                self.current_text_log_path = None
+
             blocksize = int(RECORD_SEC * SAMPLE_RATE)
-            #print(f"DEBUG: ブロックサイズ: {blocksize} (1秒分)")
 
             self.stream = sd.InputStream(callback=self.audio_callback, blocksize=blocksize)
             self.stream.start()
             print(f"{RECORD_SEC}秒間隔で録音開始...")
-            #print("DEBUG: 録音ストリーム開始完了")
 
             self.thread = threading.Thread(target=self.transcribe_worker, daemon=True)
             self.thread.start()
-            #print("DEBUG: transcribe_workerスレッド開始")
         except Exception as e:
             print(f"録音開始エラー: {e}")
+            # --- vvv 変更点 vvv ---
+            # エラー発生時にファイルが開いていれば閉じる
+            if self.wav_writer:
+                self.wav_writer.close()
+                self.wav_writer = None
+            # --- ^^^ 変更点 ^^^ ---
             raise
 
     def stop(self):
         print("\n録音停止中...")
 
-        # 1. まず録音ストリームを停止し、新しいデータが入ってこないようにします
         if hasattr(self, 'stream') and self.stream.active:
             self.stream.stop()
             self.stream.close()
             print("録音ストリームを停止しました。")
+            
+        # 録音ファイルを閉じる
+        if self.wav_writer:
+            try:
+                self.wav_writer.close()
+                print(f"WAVデータを {self.current_wav_path} に保存完了しました。")
+            except Exception as e:
+                print(f"WAVファイルのクローズ中にエラーが発生しました: {e}")
+            
+            self.wav_writer = None
+            self.current_wav_path = None
 
-        # 2. 中途半端に残っている音声データ(バッファ)をキューに追加します
-        # これがタイムアウトの直接の原因です
         if self.partial_audio_buffer:
             print(f"残りの音声データ ({sum(data.shape[0] for data in self.partial_audio_buffer)}フレーム) をキューに追加します。")
             combined_data = np.concatenate(self.partial_audio_buffer, axis=0)
             self.audio_queue.put(combined_data)
-            self.partial_audio_buffer = [] # バッファを空にする
+            self.partial_audio_buffer = []
 
-        # 3. キューが空になるまで、文字起こしスレッドに処理を続けさせます
         print("残りの文字起こし処理を待っています...")
-        # キューの全てのタスクが完了するのを待つ
         self.audio_queue.join()
 
-        # 4. 全てのデータ処理が終わったので、スレッドに停止信号を送ります
         self.stop_flag.set()
-        #print("DEBUG: stop_flagを設定しました。")
 
-        # 5. スレッドが安全に終了するのを待ちます
         if self.thread is not None and self.thread.is_alive():
             print("文字起こしスレッドの終了を待機中...")
-            self.thread.join() # タイムアウトなしで待つ
+            self.thread.join()
             print("スレッドが正常に終了しました。")
 
-        # 文字起こし完了
+        if self.current_text_log_path:
+            try:
+                with open(self.current_text_log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n--- 録音停止 ---\n")
+                print(f"即時ログを {self.current_text_log_path} に保存完了しました。")
+            except Exception as e:
+                print(f"即時ログファイルの後処理エラー: {e}")
+            self.current_text_log_path = None
+
         self.update_progress('saving', self.processing_progress['total_items'], self.processing_progress['total_items'])
         print("録音停止処理が完了しました。")
 
@@ -254,6 +318,14 @@ class MojiOkoshi:
             self.scene_transcriptions[self.current_scene] = []
         self.scene_transcriptions[self.current_scene].append(text)
         print(f"シーン '{self.current_scene}' にテキストを追加: '{text[:50]}...'")
+
+        if self.current_text_log_path:
+            try:
+                # "a" (append) モードでファイルを開き、テキストを追記
+                with open(self.current_text_log_path, "a", encoding="utf-8") as f:
+                    f.write(text + "\n")
+            except Exception as e:
+                print(f"ログファイルへの書き込みエラー: {e}")
     
     def update_progress(self, stage: str, processed: int = None, total: int = None):
         """処理進行状況を更新"""

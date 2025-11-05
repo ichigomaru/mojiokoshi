@@ -2,9 +2,41 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk
-from mojiokoshi import MojiOkoshi
+# --- vvv 変更点 vvv ---
+# MojiOkoshi クラスに加えて、LANGUAGE 定数をインポートします
+from mojiokoshi import MojiOkoshi, LANGUAGE
+# --- ^^^ 変更点 ^^^ ---
 from tkinter import messagebox
 from tkinter import simpledialog
+
+# --- vvv 変更点 vvv ---
+# kaigyou.py と kaigyou_en.py のロジックをここにヘルパー関数として定義します
+
+def _insert_newlines_ja(text):
+    """(from kaigyou.py) 文末記号の後に改行を入れる"""
+    sentence_terminators = ("。", "！", "？", ".", "!", "?")
+    new_text = ""
+    for char in text:
+        new_text += char
+        if char in sentence_terminators:
+            new_text += "\n"
+    # 特定の記号を削除
+    new_text = new_text.replace("[", "").replace("]", "").replace(",", "").replace(".", "").replace("'", "")
+    return new_text
+
+def _insert_newlines_en(text):
+    """(from kaigyou_en.py) 文末記号の後に改行を入れる"""
+    sentence_terminators = ("。", "！", "？", ".", "!", "?")
+    new_text = ""
+    for char in text:
+        new_text += char
+        if char in sentence_terminators:
+            new_text += "\n"
+    # 特定の記号を削除
+    new_text = new_text.replace("[", "").replace("]", "")
+    return new_text
+# --- ^^^ 変更点 ^^^ ---
+
 
 class MojiOkoshiGUI:
     def __init__(self):
@@ -284,12 +316,30 @@ class MojiOkoshiGUI:
                 for scene_name, text in scenes.items():
                     combined_text += f"【{scene_name}】\n{text}\n\n"
                 
+                # --- vvv 変更点 vvv ---
+                # LANGUAGE定数に基づいて、適切な改行処理を適用します
+                formatted_text = ""
+                if LANGUAGE == "ja":
+                    print("DEBUG: 日本語の改行フォーマットを適用します。")
+                    formatted_text = _insert_newlines_ja(combined_text)
+                elif LANGUAGE == "en":
+                    print("DEBUG: 英語の改行フォーマットを適用します。")
+                    formatted_text = _insert_newlines_en(combined_text)
+                else:
+                    # 'ja' 'en' 以外の場合は、デフォルトの結合テキストを使用
+                    print(f"DEBUG: '{LANGUAGE}' に対応する改行フォーマットがありません。")
+                    formatted_text = combined_text
+                # --- ^^^ 変更点 ^^^ ---
+                
                 # Save to file named by final scenario title
                 import os
                 os.makedirs("log/scenario_log", exist_ok=True)
                 filename = os.path.join("log", "scenario_log", f"{final_title}.txt")
                 with open(filename, "w", encoding="utf-8") as f:
-                    f.write(combined_text)
+                    # --- vvv 変更点 vvv ---
+                    # 元の combined_text の代わりに、フォーマット済みのテキストを書き込みます
+                    f.write(formatted_text)
+                    # --- ^^^ 変更点 ^^^ ---
                 #print(f"全シーン結合テキスト保存完了: {filename}")
                 
                 result = messagebox.showinfo(
