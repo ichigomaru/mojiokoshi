@@ -181,7 +181,9 @@ class MojiOkoshi:
                     resampled = np.clip(resampled * VOLUME, -1.0, 1.0)
 
                     # Whisperで文字起こし
-                    result = self.model.transcribe(resampled, language=LANGUAGE)
+                    # FP16 は CUDA の GPU でしか使えない。CPU では FP32 を指定して警告を出さない
+                    use_fp16 = getattr(self.model, "device", None) is not None and self.model.device.type == "cuda"
+                    result = self.model.transcribe(resampled, language=LANGUAGE, fp16=use_fp16)
                     text = clean_transcription(result)
                     print(text)
             except Exception as e:

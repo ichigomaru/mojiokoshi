@@ -461,20 +461,12 @@ class MojiOkoshiGUI:
                 filename = os.path.join("log", "scenario_log", f"{final_title}.txt")
                 with open(filename, "w", encoding="utf-8") as f:
                     f.write(formatted_text)
+                print(f"シナリオファイルを {filename} に保存しました。アプリを終了します。")
 
-                result = messagebox.showinfo(
-                    "完了",
-                    f"文字起こしが完了しました！\nシナリオファイルを保存しました\n\nアプリを終了しますか？",
-                    parent=self.root
-                )
-
-                if result:
-                    self.root.quit()  # mainloopを終了
-                    self.root.destroy()  # ウィンドウを破棄
-                    sys.exit(0)  # プロセスを終了
-                else:
-                    print("DEBUG: UIリセット")
-                    self.reset_ui()
+                # 保存したらそのまま終了する
+                self.root.quit()  # mainloopを終了
+                self.root.destroy()  # ウィンドウを破棄
+                sys.exit(0)  # プロセスを終了
             else:
                 messagebox.showwarning("未入力", "シナリオタイトルが入力されませんでした。UIをリセットします。")
                 self.reset_ui()

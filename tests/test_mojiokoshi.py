@@ -24,7 +24,8 @@ class FakeModel:
         self.max_active = 0
         self.lock = threading.Lock()
 
-    def transcribe(self, audio, language=None):
+    def transcribe(self, audio, language=None, fp16=True):
+        self.last_fp16 = fp16
         with self.lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -97,6 +98,7 @@ class MojiOkoshiTest(unittest.TestCase):
         self.assertTrue(run_with_timeout(self.m.stop), "stop() が終わらない")
         self.assertEqual(self.m.scene_transcriptions["default"], ["3s", "2s"])
         self.assertIsNone(self.m.thread)
+        self.assertFalse(self.m.model.last_fp16, "CPU では fp16=False を渡す")
 
     def test_scene_switch_assigns_audio_to_recorded_scene(self):
         self.m.model = FakeModel(delay=0.3)  # ワーカーが処理中に切り替える
@@ -291,7 +293,7 @@ class HallucinationWorkerTest(unittest.TestCase):
             {"text": "ご視聴ありがとうございました", "segments": [seg("ご視聴ありがとうございました", 0.2)]},
             {"text": "本題です", "segments": [seg("本題です")]},
         ])
-        self.m.model = types.SimpleNamespace(transcribe=lambda audio, language=None: next(outputs))
+        self.m.model = types.SimpleNamespace(transcribe=lambda audio, language=None, fp16=True: next(outputs))
         self.m.buffer_target_size = SR
 
     def tearDown(self):
