@@ -71,6 +71,11 @@ class MojiOkoshiGUI:
                                     state="disabled")
         self.stop_button.grid(row=1, column=1, padx=5, pady=5)
 
+        # Whisper モデルの読み込み状況 (読み込み中でも録音はできる)
+        self.model_status_label = tk.Label(self.root, text="モデル読み込み中...", fg="orange")
+        self.model_status_label.grid(row=1, column=2, padx=5, pady=5)
+        self._model_error_shown = False
+
         # Progress display
         self.progress_label = tk.Label(self.root, text="Progress: 0/0")
         self.progress_label.grid(row=2, column=0, columnspan=3, padx=5, pady=10)
@@ -265,6 +270,19 @@ class MojiOkoshiGUI:
                 messagebox.showerror("エラー", f"処理中にエラーが発生しました: {stop_result['error']}")
                 self.reset_ui()
                 return
+            if self.mojiokoshi.last_stop_skipped:
+                self.transcription_status_label.config(text="文字起こしはスキップしました", fg="red")
+                reason = ("モデルを読み込めなかったため" if self.mojiokoshi.model_error
+                          else "モデルの読み込みが終わる前に停止したため")
+                messagebox.showinfo(
+                    "文字起こしなし",
+                    f"{reason}、文字起こしはしませんでした。\n"
+                    + (f"録音は {self.mojiokoshi.last_wav_path} に保存されています。"
+                       if self.mojiokoshi.last_wav_path else "録音(WAV)も保存できませんでした。"),
+                    parent=self.root
+                )
+                self.reset_ui()
+                return
             self.transcription_status_label.config(text="文字起こし完了！", fg="green")
             # 完了メッセージを表示
             self.show_completion_message()
@@ -366,10 +384,23 @@ class MojiOkoshiGUI:
             processed = getattr(self.mojiokoshi, "processing_progress", {}).get("processed_items", 0)
             total = getattr(self.mojiokoshi, "processing_progress", {}).get("total_items", 0)
             self.progress_label.config(text=f"Progress: {processed}/{total}")
+            self.update_model_status()
         except Exception as e:
             print(f"DEBUG: update_progressでエラー: {e}")
         finally:
             self.root.after(500, self.update_progress)
+
+    def update_model_status(self):
+        m = self.mojiokoshi
+        if not m.model_ready.is_set():
+            return
+        if m.model is not None:
+            self.model_status_label.config(text="モデル準備完了", fg="green")
+        else:
+            self.model_status_label.config(text="モデル読み込み失敗", fg="red")
+            if not self._model_error_shown:
+                self._model_error_shown = True
+                messagebox.showerror("エラー", f"Whisperモデルを読み込めませんでした: {m.model_error}\n録音(WAV)は保存できますが、文字起こしはできません。")
 
     def run(self):
         self.root.mainloop()

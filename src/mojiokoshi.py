@@ -1,6 +1,5 @@
 import sounddevice as sd
 import numpy as np
-import whisper
 import librosa
 import threading
 import queue
@@ -24,9 +23,15 @@ LANGUAGE = "ja"           # Whisperの言語設定（例: "ja"、"en"）
 
 class MojiOkoshi:
     def __init__(self):
-        print(f"Whisperモデル({MODEL_SIZE})を読み込み中...")
-        self.model = whisper.load_model(MODEL_SIZE)
-        print("モデル読み込み完了")
+        # Whisper の読み込みは時間がかかるので裏で行い、その間も録音できるようにする
+        self.model = None
+        self.model_error = None
+        self.model_ready = threading.Event()  # 読み込みが終わったら (成功・失敗とも) セット
+        # モデル読み込み前に停止したとき、残りの音声を文字起こしせずに捨てるための合図
+        self.skip_transcription = threading.Event()
+        self.last_stop_skipped = False
+        self.last_wav_path = None
+        threading.Thread(target=self._load_model, daemon=True).start()
 
         # キューの中身は (シーン名, 音声データ) か、終了の合図の None
         self.audio_queue = queue.Queue()
@@ -63,6 +68,26 @@ class MojiOkoshi:
             'current_stage': 'idle'
         }
 
+
+    def _load_model(self):
+        try:
+            print(f"Whisperモデル({MODEL_SIZE})を裏で読み込み中...")
+            import whisper  # PyTorch の読み込みも重いので、ここで import する
+            self.model = whisper.load_model(MODEL_SIZE)
+            print("モデル読み込み完了")
+        except Exception as e:
+            self.model_error = str(e)
+            print(f"モデル読み込みエラー: {e}")
+        finally:
+            self.model_ready.set()
+
+    def _wait_for_model(self):
+        """モデルの準備ができたら True。読み込み失敗、または停止で文字起こしを諦めたら False。"""
+        while True:
+            if self.skip_transcription.is_set():
+                return False
+            if self.model_ready.wait(0.2):
+                return self.model is not None
 
     def audio_callback(self, indata, frames, time_info, status):
         if self.stop_flag.is_set():
@@ -116,6 +141,8 @@ class MojiOkoshi:
                 break
 
             scene_name, data = item # data は 48kHz / 3ch
+            if not self._wait_for_model():
+                continue
             processed_index += 1
             total_queue = processed_index + self.audio_queue.qsize()
             self.update_progress('transcribing', processed_index - 1, total_queue)
@@ -154,6 +181,7 @@ class MojiOkoshi:
 
         # 前回の録音の状態をリセット
         self.stop_flag.clear()
+        self.skip_transcription.clear()
         self.audio_queue = queue.Queue()
         with self.buffer_lock:
             self.partial_audio_buffer = []
@@ -245,14 +273,24 @@ class MojiOkoshi:
         # ストリーム停止後に届いたコールバックは無視する
         self.stop_flag.set()
 
+        # 保存に成功したときだけ last_wav_path にパスを残す
+        self.last_wav_path = None
         if self.wav_writer:
             try:
                 self.wav_writer.close()
+                self.last_wav_path = self.current_wav_path
                 print(f"WAVデータを {self.current_wav_path} に保存完了しました。")
             except Exception as e:
                 print(f"WAVファイルのクローズ中にエラーが発生しました: {e}")
             self.wav_writer = None
-            self.current_wav_path = None
+        self.current_wav_path = None
+
+        # モデルが使えないときは、たまった音声を文字起こしせずに捨てる (WAV には残っている)
+        self.last_stop_skipped = self.model is None
+        if self.last_stop_skipped:
+            reason = f"モデル読み込みエラー: {self.model_error}" if self.model_error else "モデル読み込み前に停止"
+            print(f"{reason}のため、文字起こしはスキップします。")
+            self.skip_transcription.set()
 
         with self.buffer_lock:
             if self.partial_audio_buffer:

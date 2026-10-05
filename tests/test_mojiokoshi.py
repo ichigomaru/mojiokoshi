@@ -80,6 +80,7 @@ class MojiOkoshiTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         os.chdir(self._tmp.name)
         self.m = mojiokoshi.MojiOkoshi()
+        self.assertTrue(self.m.model_ready.wait(5), "偽モデルの読み込みが終わらない")
         self.m.buffer_target_size = 3 * SR  # 3秒たまったらキューへ
 
     def tearDown(self):
@@ -166,6 +167,85 @@ class MojiOkoshiTest(unittest.TestCase):
             content = f.read()
         self.assertIn("2s", content)
         self.assertIn("録音停止", content)
+
+
+
+class BackgroundModelLoadTest(unittest.TestCase):
+    """モデルを裏で読み込んでいる間の録音・停止"""
+
+    def setUp(self):
+        self._cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+        self.release = threading.Event()
+        self._orig_load = fake_whisper.load_model
+
+        def slow_load(size):
+            self.release.wait(10)
+            if getattr(self, "load_should_fail", False):
+                raise RuntimeError("読み込み失敗(テスト)")
+            return FakeModel()
+
+        fake_whisper.load_model = slow_load
+        self.m = mojiokoshi.MojiOkoshi()
+        self.m.buffer_target_size = 3 * SR
+
+    def tearDown(self):
+        self.release.set()
+        fake_whisper.load_model = self._orig_load
+        os.chdir(self._cwd)
+        self._tmp.cleanup()
+
+    def feed(self, n):
+        for _ in range(n):
+            self.m.audio_callback(block(), SR, None, None)
+
+    def test_record_while_loading_then_transcribe(self):
+        self.m.start()  # モデル読み込み前でも録音を開始できる
+        self.assertFalse(self.m.model_ready.is_set())
+        self.feed(4)
+        self.release.set()  # 停止前に読み込み完了
+        self.assertTrue(self.m.model_ready.wait(5))
+        self.feed(1)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertFalse(self.m.last_stop_skipped)
+        self.assertEqual(self.m.scene_transcriptions["default"], ["3s", "2s"])
+
+    def test_stop_before_model_loaded_skips(self):
+        self.m.start()
+        self.feed(4)
+        self.assertTrue(run_with_timeout(self.m.stop), "読み込み前の停止で固まった")
+        self.assertTrue(self.m.last_stop_skipped)
+        self.assertEqual(self.m.scene_transcriptions.get("default", []), [])
+        self.assertTrue(os.path.getsize(self.m.last_wav_path) > 0)
+        # 後から読み込みが終わったら、次の録音は普通に文字起こしされる
+        self.release.set()
+        self.assertTrue(self.m.model_ready.wait(5))
+        self.m.switch_scene("次")
+        self.m.start()
+        self.feed(1)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertFalse(self.m.last_stop_skipped)
+        self.assertEqual(self.m.scene_transcriptions["次"], ["1s"])
+
+    def test_wav_creation_failure_reports_no_path(self):
+        self.m.voice_log_dir = os.path.join(self._tmp.name, "存在しないフォルダ")
+        self.m.start()
+        self.feed(1)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertTrue(self.m.last_stop_skipped)
+        self.assertIsNone(self.m.last_wav_path)
+
+    def test_model_load_failure(self):
+        self.load_should_fail = True
+        self.m.start()
+        self.feed(4)
+        self.release.set()
+        self.assertTrue(self.m.model_ready.wait(5))
+        self.assertIsNone(self.m.model)
+        self.assertIn("読み込み失敗", self.m.model_error)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertTrue(self.m.last_stop_skipped)
 
 
 if __name__ == "__main__":
