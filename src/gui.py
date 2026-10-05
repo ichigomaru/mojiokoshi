@@ -10,21 +10,25 @@ import customtkinter as ctk
 
 from mojiokoshi import MojiOkoshi, LANGUAGE
 
-# --- 見た目の設定 (色は (ライト, ダーク) の組) ---
-ctk.set_appearance_mode("system")  # Mac のライト/ダーク設定に合わせる
+# --- 見た目の設定 (ハードウェア風。配色が前提なのでライト固定) ---
+ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
-RED = ("#E5484D", "#E5484D")
-RED_HOVER = ("#C93C41", "#C93C41")
-NEUTRAL = ("gray80", "gray30")
-NEUTRAL_HOVER = ("gray72", "gray36")
-NEUTRAL_TEXT = ("gray10", "gray92")
-MUTED = ("gray40", "gray62")
-GREEN = ("#2E7D32", "#5BD16B")
-ORANGE = ("#B26A00", "#F0A040")
-SEPARATOR = ("gray82", "gray28")
-HISTORY_BG = ("gray97", "gray17")
-HIGHLIGHT = ("#E8F0FE", "#1E3A5F")
+BODY = "#E7E5DF"          # 本体の色
+DISPLAY = "#141414"       # 黒い表示パネル
+DISPLAY_TEXT = "#F2F2F2"
+DISPLAY_MUTED = "#7A7A7A"
+ORANGE = "#FF5A1F"        # アクセント (録音・タイマー)
+ORANGE_HOVER = "#E64C14"
+INK = "#1A1A1A"           # 黒いボタン・文字
+INK_HOVER = "#333333"
+KEY = "#F7F6F2"           # 白いキー (入力欄・副ボタン)
+KEY_HOVER = "#EDEBE5"
+KEY_BORDER = "#CFCCC3"
+MUTED = "#6B6862"
+TRACK = "#C9C6BD"         # 進捗バーの残り
+DISABLED = "#B9B6AE"
+GREEN = "#2F8F46"
 
 
 def _insert_newlines_ja(text):
@@ -61,7 +65,7 @@ def _format_elapsed(seconds):
 
 class MojiOkoshiGUI:
     def __init__(self):
-        self.root = ctk.CTk()
+        self.root = ctk.CTk(fg_color=BODY)
         self.root.title("MojiOkoshi")
         self.root.attributes("-topmost", True)
         self.root.geometry("520x360")
@@ -73,12 +77,14 @@ class MojiOkoshiGUI:
         self.record_started_at = None
         self._blink = False
         self._model_error_shown = False
+        self._warning_shown = False
         self.scene_history = []
 
-        self.font_title = ctk.CTkFont(size=15, weight="bold")
+        self.font_timer = ctk.CTkFont(family="Menlo", size=30)
+        self.font_scene = ctk.CTkFont(size=15, weight="bold")
+        self.font_key = ctk.CTkFont(size=13, weight="bold")
         self.font_body = ctk.CTkFont(size=13)
-        self.font_small = ctk.CTkFont(size=12)
-        self.font_section = ctk.CTkFont(size=12, weight="bold")
+        self.font_tag = ctk.CTkFont(family="Menlo", size=10)
         self.font_mono = ctk.CTkFont(family="Menlo", size=12)
 
         self.root.grid_columnconfigure(0, weight=1)
@@ -96,73 +102,83 @@ class MojiOkoshiGUI:
     # ------------------------------------------------------------------
     # 画面の組み立て
     # ------------------------------------------------------------------
-    def _separator(self, row):
-        ctk.CTkFrame(self.body, height=1, fg_color=SEPARATOR).grid(
-            row=row, column=0, columnspan=2, sticky="ew", pady=8)
+    def _key_button(self, parent, text, command, primary=False, **kw):
+        if primary:
+            colors = dict(fg_color=ORANGE, hover_color=ORANGE_HOVER, text_color="white")
+        else:
+            colors = dict(fg_color=KEY, hover_color=KEY_HOVER, text_color=INK,
+                          border_width=1, border_color=KEY_BORDER)
+        return ctk.CTkButton(parent, text=text, command=command, corner_radius=6, height=40,
+                             font=self.font_key, text_color_disabled=DISABLED, **colors, **kw)
 
     def _build_layout(self):
-        """カードを使わず、1枚の画面に上から 状態 → シーン → 履歴 の順に並べる"""
+        """上から 表示パネル → 操作キー → 進み具合 → ログ の順に並べる"""
         self.body = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.body.grid(row=0, column=0, sticky="nsew", padx=16, pady=(12, 12))
+        self.body.grid(row=0, column=0, sticky="nsew", padx=14, pady=(12, 12))
         self.root.grid_rowconfigure(0, weight=1)
         body = self.body
-        body.grid_columnconfigure((0, 1), weight=1, uniform="col")
+        body.grid_columnconfigure(0, weight=1)
 
-        # --- 状態 ---
-        self.record_status_label = ctk.CTkLabel(body, text="●  待機中", font=self.font_title, text_color=MUTED, height=24)
-        self.record_status_label.grid(row=0, column=0, sticky="w")
-        # Whisper モデルの読み込み状況 (読み込み中でも録音はできる)
-        self.model_status_label = ctk.CTkLabel(body, text="◌ モデル読み込み中…", font=self.font_small, text_color=ORANGE, height=24)
-        self.model_status_label.grid(row=0, column=1, sticky="e")
+        # --- 黒い表示パネル: シーン番号・シーン名 (左) / 状態・タイマー (右) ---
+        display = ctk.CTkFrame(body, fg_color=DISPLAY, corner_radius=8)
+        display.grid(row=0, column=0, sticky="ew")
+        display.grid_columnconfigure(0, weight=1)
+        self.scene_no_label = ctk.CTkLabel(display, text="SCENE --", font=self.font_tag,
+                                           text_color=DISPLAY_MUTED, height=14)
+        self.scene_no_label.grid(row=0, column=0, sticky="w", padx=12, pady=(8, 0))
+        self.record_status_label = ctk.CTkLabel(display, text="STANDBY", font=self.font_tag,
+                                                text_color=DISPLAY_MUTED, height=14)
+        self.record_status_label.grid(row=0, column=1, sticky="e", padx=12, pady=(8, 0))
+        self.current_scene_label = ctk.CTkLabel(display, text="未設定", font=self.font_scene,
+                                                text_color=DISPLAY_TEXT, anchor="w")
+        self.current_scene_label.grid(row=1, column=0, sticky="sw", padx=12, pady=(0, 8))
+        self.timer_label = ctk.CTkLabel(display, text="00:00", font=self.font_timer,
+                                        text_color=DISPLAY_MUTED, height=34)
+        self.timer_label.grid(row=1, column=1, sticky="e", padx=12, pady=(0, 6))
 
-        self.start_button = ctk.CTkButton(
-            body, text="●  録音開始", height=36, corner_radius=8, font=self.font_title,
-            fg_color=RED, hover_color=RED_HOVER, command=self.start_recording)
-        self.start_button.grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(6, 8))
-        self.stop_button = ctk.CTkButton(
-            body, text="■  停止", height=36, corner_radius=8, font=self.font_title,
-            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, text_color=NEUTRAL_TEXT,
-            state="disabled", command=self.stop_recording)
-        self.stop_button.grid(row=1, column=1, sticky="ew", padx=(5, 0), pady=(6, 8))
-
-        # 文字起こしの進み具合 (左: 件数と状況メッセージ、右: バー)
-        progress_row = ctk.CTkFrame(body, fg_color="transparent")
-        progress_row.grid(row=2, column=0, columnspan=2, sticky="ew")
-        progress_row.grid_columnconfigure(2, weight=1)
-        self.progress_label = ctk.CTkLabel(progress_row, text="文字起こし  0 / 0", font=self.font_small, text_color=MUTED, height=20)
-        self.progress_label.grid(row=0, column=0, sticky="w")
-        # Transcription status display
-        self.transcription_status_label = ctk.CTkLabel(progress_row, text="", font=self.font_small, text_color=MUTED, height=20)
-        self.transcription_status_label.grid(row=0, column=1, sticky="w", padx=(10, 10))
-        self.progress_bar = ctk.CTkProgressBar(progress_row, height=6, corner_radius=3)
-        self.progress_bar.grid(row=0, column=2, sticky="ew")
-        self.progress_bar.set(0)
-
-        self._separator(3)
-
-        # --- シーン ---
-        self.current_scene_label = ctk.CTkLabel(body, text="シーン:  未設定", font=self.font_title, anchor="w", height=24)
-        self.current_scene_label.grid(row=4, column=0, columnspan=2, sticky="w")
-        scene_row = ctk.CTkFrame(body, fg_color="transparent")
-        scene_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        scene_row.grid_columnconfigure(0, weight=1)
-        self.scene_title_entry = ctk.CTkEntry(scene_row, placeholder_text="次のシーン名", height=32, font=self.font_body)
-        self.scene_title_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        # --- 操作キー: REC/STOP (1つのボタンで切り替え) / 次のシーン名 / +SCENE ---
+        keys = ctk.CTkFrame(body, fg_color="transparent")
+        keys.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        keys.grid_columnconfigure(1, weight=1)
+        self.record_button = self._key_button(keys, "●  REC", self.toggle_recording, primary=True, width=130)
+        self.record_button.grid(row=0, column=0, padx=(0, 8))
+        self.scene_title_entry = ctk.CTkEntry(
+            keys, placeholder_text="次のシーン名", height=40, corner_radius=6, font=self.font_body,
+            fg_color=KEY, border_color=KEY_BORDER, border_width=1, text_color=INK,
+            placeholder_text_color="#A09C93")
+        self.scene_title_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.scene_title_entry.bind("<KeyRelease>", self.on_scene_title_change)
         self.scene_title_entry.bind("<Return>", lambda e: self.switch_scene())
-        self.switch_scene_button = ctk.CTkButton(
-            scene_row, text="切り替え", width=90, height=32, corner_radius=8, command=self.switch_scene)
-        self.switch_scene_button.grid(row=0, column=1)
-        # 重複などの警告 (普段は空)
-        self.scene_warning_label = ctk.CTkLabel(body, text="", font=self.font_small, text_color=RED, height=16)
-        self.scene_warning_label.grid(row=6, column=0, columnspan=2, sticky="w")
+        self.switch_scene_button = self._key_button(keys, "＋ SCENE", self.switch_scene, width=100)
+        self.switch_scene_button.grid(row=0, column=2)
 
-        # --- 履歴 ---
-        ctk.CTkLabel(body, text="履歴", font=self.font_section, text_color=MUTED, height=18).grid(
-            row=7, column=0, sticky="w")
-        body.grid_rowconfigure(8, weight=1)
-        self.history_frame = ctk.CTkScrollableFrame(body, height=84, corner_radius=8, fg_color=HISTORY_BG)
-        self.history_frame.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=(2, 0))
+        # --- 進み具合 (四角いバー) とモデル状態 ---
+        self.progress_bar = ctk.CTkProgressBar(body, height=5, corner_radius=0,
+                                               fg_color=TRACK, progress_color=INK)
+        self.progress_bar.grid(row=2, column=0, sticky="ew", pady=(12, 2))
+        self.progress_bar.set(0)
+        info = ctk.CTkFrame(body, fg_color="transparent")
+        info.grid(row=3, column=0, sticky="ew")
+        info.grid_columnconfigure(1, weight=1)
+        self.progress_label = ctk.CTkLabel(info, text="TRANSCRIBE 0/0", font=self.font_tag,
+                                           text_color=MUTED, height=16)
+        self.progress_label.grid(row=0, column=0, sticky="w")
+        # 状況メッセージ・シーン名の警告 (普段は空)
+        self.transcription_status_label = ctk.CTkLabel(info, text="", font=self.font_tag,
+                                                       text_color=MUTED, height=16)
+        self.transcription_status_label.grid(row=0, column=1, sticky="w", padx=10)
+        self.scene_warning_label = self.transcription_status_label
+        # Whisper モデルの読み込み状況 (読み込み中でも録音はできる)
+        self.model_status_label = ctk.CTkLabel(info, text="MODEL ○ LOADING", font=self.font_tag,
+                                               text_color=ORANGE, height=16)
+        self.model_status_label.grid(row=0, column=2, sticky="e")
+
+        # --- ログ (シーン履歴) ---
+        body.grid_rowconfigure(4, weight=1)
+        self.history_frame = ctk.CTkScrollableFrame(
+            body, height=80, corner_radius=6, fg_color=KEY, border_width=1, border_color=KEY_BORDER,
+            scrollbar_button_color=TRACK, scrollbar_button_hover_color=MUTED)
+        self.history_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
         self.history_frame.grid_columnconfigure(0, weight=1)
         self.history_rows = []
 
@@ -175,24 +191,26 @@ class MojiOkoshiGUI:
         メイン画面は -topmost なので、開いている間だけ外してダイアログを -topmost にする
         (macOS では transient を付けると -topmost が効かないので付けない)。
         """
-        dialog = ctk.CTkToplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root, fg_color=BODY)
         dialog.title(title)
         dialog.resizable(False, False)
         dialog.grid_columnconfigure((0, 1), weight=1, uniform="btn")
 
         result = {"action": "close", "text": None}
 
-        ctk.CTkLabel(dialog, text=message, font=self.font_title).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(18, 8))
-        entry = ctk.CTkEntry(dialog, placeholder_text=placeholder, width=320, height=36, font=self.font_body)
-        entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20)
-        warning = ctk.CTkLabel(dialog, text="", font=self.font_small, text_color=RED, height=18)
-        warning.grid(row=2, column=0, columnspan=2, sticky="w", padx=20)
+        ctk.CTkLabel(dialog, text=message, font=self.font_scene, text_color=INK).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(16, 8))
+        entry = ctk.CTkEntry(dialog, placeholder_text=placeholder, width=320, height=38, corner_radius=6,
+                             font=self.font_body, fg_color=KEY, border_color=KEY_BORDER, border_width=1,
+                             text_color=INK, placeholder_text_color="#A09C93")
+        entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18)
+        warning = ctk.CTkLabel(dialog, text="", font=self.font_tag, text_color=ORANGE, height=16)
+        warning.grid(row=2, column=0, columnspan=2, sticky="w", padx=18)
 
         def on_ok():
             text = entry.get().strip()
             if not text:
-                warning.configure(text="入力してください。")
+                warning.configure(text="入力してください")
                 return
             result.update(action="ok", text=text)
             dialog.destroy()
@@ -202,12 +220,11 @@ class MojiOkoshiGUI:
             dialog.destroy()
 
         if secondary_text:
-            ctk.CTkButton(dialog, text=secondary_text, height=36, corner_radius=8,
-                          fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, text_color=NEUTRAL_TEXT,
-                          command=on_secondary).grid(row=3, column=0, sticky="ew", padx=(20, 6), pady=(4, 18))
-        ctk.CTkButton(dialog, text=ok_text, height=36, corner_radius=8, command=on_ok).grid(
+            self._key_button(dialog, secondary_text, on_secondary).grid(
+                row=3, column=0, sticky="ew", padx=(18, 5), pady=(2, 16))
+        self._key_button(dialog, ok_text, on_ok, primary=True).grid(
             row=3, column=1 if secondary_text else 0, columnspan=1 if secondary_text else 2,
-            sticky="ew", padx=(6, 20) if secondary_text else 20, pady=(4, 18))
+            sticky="ew", padx=(5, 18) if secondary_text else 18, pady=(2, 16))
 
         entry.bind("<Return>", lambda e: on_ok())
         dialog.bind("<Escape>", lambda e: on_secondary() if secondary_text else dialog.destroy())
@@ -249,54 +266,69 @@ class MojiOkoshiGUI:
         """シーン名入力が変更されたときの処理。ボタン状態を更新し、警告を消す。"""
         self.update_switch_scene_button_state()
 
+    def _set_status(self, text, color=MUTED):
+        """状況メッセージを出す (シーン名の警告を上書きする)"""
+        self.transcription_status_label.configure(text=text, text_color=color)
+        self._warning_shown = False
+
+    def _show_warning(self, text):
+        """シーン名の警告を出す (状況メッセージと同じ欄を使うので、警告かどうかを覚えておく)"""
+        self.scene_warning_label.configure(text=text, text_color=ORANGE)
+        self._warning_shown = True
+
     def update_switch_scene_button_state(self):
         """
         シーン切り替えボタンの状態を更新。重複シーン名があればボタンを無効化し警告を表示。
         有効なシーン名が入力されたらボタンを有効化し警告を消す。
         """
         scene_title = self.scene_title_entry.get().strip()
-        self.scene_warning_label.configure(text="")
+        if self._warning_shown:
+            self.scene_warning_label.configure(text="")
+            self._warning_shown = False
         # If empty or stopping, disable button
         if not scene_title or self.state == "stopping":
             self.switch_scene_button.configure(state="disabled")
             return
         if scene_title in self.mojiokoshi.scene_transcriptions:
             self.switch_scene_button.configure(state="disabled")
-            self.scene_warning_label.configure(text=f"「{scene_title}」は既に使われています")
+            self._show_warning(f"「{scene_title}」は使用済み")
             return
         # No duplication: enable button and clear warning
         self.switch_scene_button.configure(state="normal")
 
     def add_scene_to_history(self, scene_name):
-        """シーン履歴に新しいシーンを追加し、現在のシーン表示を更新"""
+        """シーン履歴に新しいシーンを追加し、表示パネルを更新"""
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.scene_history.append(f"[{timestamp}] {scene_name}")
 
-        for time_label, name_label in self.history_rows:
-            name_label.configure(font=self.font_body, text_color=NEUTRAL_TEXT)
-            time_label.master.configure(fg_color="transparent")
+        for no_label, name_label in self.history_rows:
+            no_label.configure(text_color=MUTED)
+            name_label.configure(text_color=MUTED)
 
         row = len(self.history_rows)
-        row_frame = ctk.CTkFrame(self.history_frame, corner_radius=6, fg_color=HIGHLIGHT)
-        row_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=1)
+        row_frame = ctk.CTkFrame(self.history_frame, fg_color="transparent")
+        row_frame.grid(row=row, column=0, sticky="ew")
         row_frame.grid_columnconfigure(1, weight=1)
-        time_label = ctk.CTkLabel(row_frame, text=timestamp, font=self.font_mono, text_color=MUTED, height=24)
-        time_label.grid(row=0, column=0, padx=(8, 10), pady=0)
-        name_label = ctk.CTkLabel(row_frame, text=scene_name, font=self.font_title, anchor="w", height=24)
-        name_label.grid(row=0, column=1, sticky="w", pady=0)
-        self.history_rows.append((time_label, name_label))
+        no_label = ctk.CTkLabel(row_frame, text=f"{row + 1:02d}  {timestamp}", font=self.font_mono,
+                                text_color=ORANGE, height=22)
+        no_label.grid(row=0, column=0, padx=(6, 12))
+        name_label = ctk.CTkLabel(row_frame, text=scene_name, font=self.font_body, text_color=INK,
+                                  anchor="w", height=22)
+        name_label.grid(row=0, column=1, sticky="w")
+        self.history_rows.append((no_label, name_label))
 
         # 最新の行が見えるようにスクロール
         self.root.after(50, lambda: self.history_frame._parent_canvas.yview_moveto(1.0))
-        self.current_scene_label.configure(text=f"シーン:  {scene_name}")
+        self.scene_no_label.configure(text=f"SCENE {len(self.history_rows):02d}")
+        self.current_scene_label.configure(text=scene_name)
 
     def switch_scene(self):
         if self.state == "stopping":
-            self.scene_warning_label.configure(text="停止処理中はシーンを切り替えられません")
+            self._show_warning("停止処理中は切り替えられません")
             return
         scene_title = self.scene_title_entry.get().strip()
         if not scene_title:
-            self.scene_warning_label.configure(text="シーン名を入力してください")
+            self._show_warning("シーン名を入力してください")
             return
 
         # MojiOkoshiのswitch_sceneメソッドを呼び出す
@@ -314,6 +346,13 @@ class MojiOkoshiGUI:
     # ------------------------------------------------------------------
     # 録音
     # ------------------------------------------------------------------
+    def toggle_recording(self):
+        """REC/STOP ボタン: 待機中なら録音開始、録音中なら停止"""
+        if self.state == "idle":
+            self.start_recording()
+        elif self.state == "recording":
+            self.stop_recording()
+
     def start_recording(self):
         if self.state != "idle":
             return
@@ -325,19 +364,17 @@ class MojiOkoshiGUI:
             return
         self.state = "recording"
         self.record_started_at = time.time()
-        self.start_button.configure(state="disabled", text="●  録音中", fg_color=NEUTRAL)
-        self.stop_button.configure(state="normal", fg_color=RED, hover_color=RED_HOVER, text_color=("white", "white"))
-        self.transcription_status_label.configure(text="")
+        self.record_button.configure(text="■  STOP", fg_color=INK, hover_color=INK_HOVER)
+        self._set_status("")
         self.update_record_status()
 
     def stop_recording(self):
         if self.state != "recording":
             return
         self.state = "stopping"
-        self.stop_button.configure(state="disabled", text="処理中…",
-                                   fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, text_color=NEUTRAL_TEXT)
+        self.record_button.configure(state="disabled", text="…", fg_color=TRACK)
         self.update_switch_scene_button_state()
-        self.transcription_status_label.configure(text="残りの音声を文字起こし中…", text_color=ORANGE)
+        self._set_status("残りを文字起こし中…", MUTED)
         self.update_record_status()
 
         # 録音停止処理を別スレッドで実行（UIをブロックしないため）
@@ -373,7 +410,7 @@ class MojiOkoshiGUI:
                 self.reset_ui()
                 return
             if self.mojiokoshi.last_stop_skipped:
-                self.transcription_status_label.configure(text="文字起こしはスキップしました", text_color=RED)
+                self._set_status("文字起こしはスキップしました", ORANGE)
                 reason = ("モデルを読み込めなかったため" if self.mojiokoshi.model_error
                           else "モデルの読み込みが終わる前に停止したため")
                 messagebox.showinfo(
@@ -385,7 +422,7 @@ class MojiOkoshiGUI:
                 )
                 self.reset_ui()
                 return
-            self.transcription_status_label.configure(text="✓ 文字起こし完了", text_color=GREEN)
+            self._set_status("✓ 文字起こし完了", GREEN)
             # 完了メッセージを表示
             self.show_completion_message()
 
@@ -448,11 +485,9 @@ class MojiOkoshiGUI:
     def reset_ui(self):
         """UIをリセット"""
         try:
-            if self.start_button.winfo_exists():
-                self.start_button.configure(state="normal", text="●  録音開始", fg_color=RED)
-            if self.stop_button.winfo_exists():
-                self.stop_button.configure(state="disabled", text="■  停止",
-                                           fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, text_color=NEUTRAL_TEXT)
+            if self.record_button.winfo_exists():
+                self.record_button.configure(state="normal", text="●  REC",
+                                             fg_color=ORANGE, hover_color=ORANGE_HOVER)
         except tk.TclError:
             return
 
@@ -467,13 +502,14 @@ class MojiOkoshiGUI:
     def update_record_status(self):
         if self.state == "recording":
             self._blink = not self._blink
-            elapsed = _format_elapsed(time.time() - self.record_started_at)
-            self.record_status_label.configure(
-                text=f"{'●' if self._blink else '○'}  録音中  {elapsed}", text_color=RED)
+            self.record_status_label.configure(text="● REC" if self._blink else "  REC", text_color=ORANGE)
+            self.timer_label.configure(text=_format_elapsed(time.time() - self.record_started_at),
+                                       text_color=ORANGE)
         elif self.state == "stopping":
-            self.record_status_label.configure(text="◌  停止処理中…", text_color=ORANGE)
+            self.record_status_label.configure(text="PROCESSING", text_color=DISPLAY_TEXT)
         else:
-            self.record_status_label.configure(text="●  待機中", text_color=MUTED)
+            self.record_status_label.configure(text="STANDBY", text_color=DISPLAY_MUTED)
+            self.timer_label.configure(text_color=DISPLAY_MUTED)
 
     def update_progress(self):
         """進み具合・録音時間・モデル状態を定期的に更新する"""
@@ -481,8 +517,10 @@ class MojiOkoshiGUI:
             progress = getattr(self.mojiokoshi, "processing_progress", {})
             processed = progress.get("processed_items", 0)
             total = progress.get("total_items", 0)
-            self.progress_label.configure(text=f"文字起こし  {processed} / {total}")
+            self.progress_label.configure(text=f"TRANSCRIBE {processed}/{total}")
             self.progress_bar.set(processed / total if total else 0)
+            # 0 のときも左端に黒い点が出るので、色を残りと同じにして隠す
+            self.progress_bar.configure(progress_color=INK if processed else TRACK)
             if self.state == "recording":
                 self.update_record_status()
             self.update_model_status()
@@ -496,9 +534,9 @@ class MojiOkoshiGUI:
         if not m.model_ready.is_set():
             return
         if m.model is not None:
-            self.model_status_label.configure(text="✓ モデル準備完了", text_color=GREEN)
+            self.model_status_label.configure(text="MODEL ● READY", text_color=GREEN)
         else:
-            self.model_status_label.configure(text="✕ モデル読み込み失敗", text_color=RED)
+            self.model_status_label.configure(text="MODEL ✕ ERROR", text_color=ORANGE)
             if not self._model_error_shown:
                 self._model_error_shown = True
                 messagebox.showerror("エラー", f"Whisperモデルを読み込めませんでした: {m.model_error}\n録音(WAV)は保存できますが、文字起こしはできません。")
