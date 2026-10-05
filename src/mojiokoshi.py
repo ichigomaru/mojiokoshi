@@ -13,7 +13,8 @@ RECORD_SEC = 1            # 1秒ごとの分割録音 (シーン切り替え・�
 BUFFER_SEC = 60           # 60秒分貯まったらキューに送る
 SAMPLE_RATE = 48000       # 録音時サンプルレート
 TARGET_SR = 16000         # Whisper用サンプルレート
-NUM_CHANNEL = 3
+NUM_CHANNEL = None        # None なら録音開始時に SD_DEVICE の入力チャンネル数を自動で使う
+VIRTUAL_CHANNELS = 2      # SD_DEVICE (集約デバイス) の最後の何chが Mac の音 (BlackHole) か。残りはマイク
 VOLUME = 1.3
 MODEL_SIZE = "large"      # whisperモデルサイズ
 SD_DEVICE = "mojiokoshi"  # spot検索、オーディオデバイスの設定から変更可能
@@ -39,6 +40,32 @@ def clean_transcription(result):
             continue
         kept.append(text)
     return "".join(kept).strip()
+
+def split_mic_virtual(data):
+    """
+    (フレーム, チャンネル) の音声を (マイク, Mac の音) の2本のモノラルに分ける。
+    最後の VIRTUAL_CHANNELS ch が Mac の音、その前がマイク。チャンネルが足りなければ全部マイク扱い。
+    """
+    if data.ndim == 1:
+        return data, np.zeros_like(data)
+    n = data.shape[1]
+    if n > VIRTUAL_CHANNELS:
+        return data[:, :n - VIRTUAL_CHANNELS].mean(axis=1), data[:, n - VIRTUAL_CHANNELS:].mean(axis=1)
+    return data.mean(axis=1), np.zeros(data.shape[0], dtype=data.dtype)
+
+
+def to_whisper_mono(data):
+    """Whisper に渡すモノラル。全チャンネルの平均だと無音のチャンネルで声が小さくなるので、マイクと Mac の音を足す"""
+    mic, virtual = split_mic_virtual(data)
+    return np.clip(mic + virtual, -1.0, 1.0)
+
+
+def detect_input_channels():
+    """SD_DEVICE の入力チャンネル数 (マイクを付け替えると集約デバイスのチャンネル数が変わる)"""
+    if NUM_CHANNEL is not None:
+        return NUM_CHANNEL
+    return int(sd.query_devices(SD_DEVICE, "input")["max_input_channels"])
+
 
 class MojiOkoshi:
     def __init__(self):
@@ -114,24 +141,17 @@ class MojiOkoshi:
         if status:
             print(f"audio_callback status: {status}")
             
-        # --- 3ch -> 2ch へのミックスダウンを正しく実行 ---
+        # --- WAV はマイク (左) と Mac の音 (右) の 2ch / 16kHz で保存 ---
         try:
             if self.wav_writer:
-                indata_t = indata.T
-
-                resampled_data_t = librosa.resample(indata_t, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
-                resampled_data = resampled_data_t.T
-
-                mic_channel = resampled_data[:, 0]
-                virtual_mono = np.mean(resampled_data[:, 1:3], axis=1)
-
-                output_data = np.stack((mic_channel, virtual_mono), axis=1)
-                self.wav_writer.write(output_data)
+                mic, virtual = split_mic_virtual(indata)
+                resampled = librosa.resample(np.stack((mic, virtual)), orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
+                self.wav_writer.write(resampled.T)
                 
         except Exception as e:
             print(f"WAVファイルへの書き込みエラー: {e}")
             
-        # 処理キューには 48kHz / 3ch のデータをそのまま渡す
+        # 処理キューには 48kHz / 全チャンネルのデータをそのまま渡す
         with self.buffer_lock:
             self.partial_audio_buffer.append(indata.copy())
             total_frames = sum(data.shape[0] for data in self.partial_audio_buffer)
@@ -167,11 +187,8 @@ class MojiOkoshi:
             self.update_progress('transcribing', processed_index - 1, total_queue)
             print(f"処理開始 ({processed_index} / {total_queue}) [シーン: {scene_name}]")
             try:
-                # モノラル化 (np.meanが3chすべてを平均化してくれる)
-                if data.ndim > 1:
-                    mono = np.mean(data, axis=1)
-                else:
-                    mono = data.flatten()
+                # モノラル化 (マイク + Mac の音)
+                mono = to_whisper_mono(data)
 
                 if mono.size == 0:
                     text = "[音声なし]"
@@ -212,7 +229,11 @@ class MojiOkoshi:
         try:
             sd.default.device = SD_DEVICE
             sd.default.samplerate = SAMPLE_RATE # 48000
-            sd.default.channels = NUM_CHANNEL # 3
+            channels = detect_input_channels()
+            sd.default.channels = channels
+            mic_ch = channels - VIRTUAL_CHANNELS if channels > VIRTUAL_CHANNELS else channels
+            virtual_ch = channels - mic_ch
+            print(f"入力: {SD_DEVICE} {channels}ch (マイク {mic_ch}ch + Mac の音 {virtual_ch}ch)")
 
             now = datetime.datetime.now()
             timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")

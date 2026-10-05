@@ -56,6 +56,8 @@ fake_whisper.load_model = lambda size: FakeModel()
 fake_sd = types.ModuleType("sounddevice")
 fake_sd.default = types.SimpleNamespace(device=None, samplerate=None, channels=None)
 fake_sd.InputStream = FakeStream
+FAKE_CHANNELS = {"n": 3}  # 偽の集約デバイスの入力チャンネル数
+fake_sd.query_devices = lambda device=None, kind=None: {"name": device, "max_input_channels": FAKE_CHANNELS["n"]}
 sys.modules["whisper"] = fake_whisper
 sys.modules["sounddevice"] = fake_sd
 
@@ -65,7 +67,7 @@ SR = mojiokoshi.SAMPLE_RATE
 
 
 def block(sec=1.0):
-    return np.full((int(SR * sec), mojiokoshi.NUM_CHANNEL), 0.1, dtype=np.float32)
+    return np.full((int(SR * sec), FAKE_CHANNELS["n"]), 0.1, dtype=np.float32)
 
 
 def run_with_timeout(func, timeout=10):
@@ -249,6 +251,61 @@ class BackgroundModelLoadTest(unittest.TestCase):
         self.assertTrue(run_with_timeout(self.m.stop))
         self.assertTrue(self.m.last_stop_skipped)
 
+
+
+class ChannelTest(unittest.TestCase):
+    """マイクを付け替えて集約デバイスのチャンネル数が変わっても、マイクと Mac の音を正しく分ける"""
+
+    def frames(self, *cols):
+        return np.array([cols] * 4, dtype=np.float32)
+
+    def test_split(self):
+        # 4ch: USB マイク 2ch + BlackHole 2ch
+        mic, virtual = mojiokoshi.split_mic_virtual(self.frames(0.2, 0.4, 0.0, 0.1))
+        np.testing.assert_allclose(mic, 0.3); np.testing.assert_allclose(virtual, 0.05)
+        # 3ch: Mac 内蔵マイク 1ch + BlackHole 2ch
+        mic, virtual = mojiokoshi.split_mic_virtual(self.frames(0.5, 0.2, 0.0))
+        np.testing.assert_allclose(mic, 0.5); np.testing.assert_allclose(virtual, 0.1)
+        # 2ch 以下: 全部マイク
+        mic, virtual = mojiokoshi.split_mic_virtual(self.frames(0.2, 0.4))
+        np.testing.assert_allclose(mic, 0.3); np.testing.assert_allclose(virtual, 0.0)
+        mic, virtual = mojiokoshi.split_mic_virtual(np.full(4, 0.7, dtype=np.float32))
+        np.testing.assert_allclose(mic, 0.7); np.testing.assert_allclose(virtual, 0.0)
+
+    def test_voice_not_diluted_by_silent_channels(self):
+        # マイクだけ鳴っていて Mac の音が無音でも、声の大きさはマイクのまま (全ch平均だと半分になっていた)
+        np.testing.assert_allclose(mojiokoshi.to_whisper_mono(self.frames(0.4, 0.4, 0.0, 0.0)), 0.4)
+        np.testing.assert_allclose(mojiokoshi.to_whisper_mono(self.frames(0.9, 0.9, 0.9, 0.9)), 1.0)  # はみ出さない
+
+    def test_detect_channels(self):
+        orig = FAKE_CHANNELS["n"]
+        try:
+            for n in (3, 4):
+                FAKE_CHANNELS["n"] = n
+                self.assertEqual(mojiokoshi.detect_input_channels(), n)
+        finally:
+            FAKE_CHANNELS["n"] = orig
+
+    def test_record_with_4_channels(self):
+        orig = FAKE_CHANNELS["n"]
+        FAKE_CHANNELS["n"] = 4
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                m = mojiokoshi.MojiOkoshi()
+                self.assertTrue(m.model_ready.wait(5))
+                m.start()
+                wav = m.current_wav_path
+                m.audio_callback(block(), SR, None, None)
+                self.assertTrue(run_with_timeout(m.stop))
+                self.assertEqual(m.scene_transcriptions["default"], ["1s"])
+                import soundfile as sf
+                info = sf.info(wav)
+                self.assertEqual((info.channels, info.samplerate), (2, 16000))
+            finally:
+                os.chdir(cwd)
+                FAKE_CHANNELS["n"] = orig
 
 
 def seg(text, no_speech=0.1):
