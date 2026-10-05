@@ -377,10 +377,17 @@ class MojiOkoshi:
         dialog.geometry("400x150")
         dialog.resizable(False, False)
         
+        # 親ウィンドウ(-topmost)の裏に回らないよう、開いている間は親の -topmost を外し、
+        # ダイアログだけを -topmost にする。macOS では transient を付けると -topmost が効かないので付けない
+        parent_was_topmost = False
         if parent_window:
-            dialog.transient(parent_window)
+            parent_was_topmost = bool(parent_window.attributes("-topmost"))
+            parent_window.attributes("-topmost", False)
             dialog.grab_set()
             dialog.geometry("+%d+%d" % (parent_window.winfo_rootx() + 50, parent_window.winfo_rooty() + 50))
+        dialog.attributes("-topmost", True)
+        dialog.lift()
+        dialog.focus_force()
         
         label = tk.Label(dialog, text="最初のシーン名を入力してください:", font=("Arial", 12))
         label.pack(pady=20)
@@ -401,7 +408,7 @@ class MojiOkoshi:
                 self.switch_scene(scene_name)
                 dialog.destroy()
             else:
-                messagebox.showwarning("警告", "シーン名を入力してください。")
+                messagebox.showwarning("警告", "シーン名を入力してください。", parent=dialog)
         
         def on_cancel():
             result["scene_name"] = "default"
@@ -419,6 +426,7 @@ class MojiOkoshi:
         
         if parent_window:
             dialog.wait_window()
+            parent_window.attributes("-topmost", parent_was_topmost)
         else:
             dialog.mainloop()
         
