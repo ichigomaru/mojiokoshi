@@ -222,6 +222,7 @@ class MojiOkoshiGUI:
     def stop_recording(self):
         if self.is_recording:
             self.is_recording = False
+            self.mojiokoshi.audio_queue.put(None)
             self.stop_button.config(state="disabled", text="処理中...")
             
             # 録音停止処理を別スレッドで実行（UIをブロックしないため）
@@ -269,28 +270,34 @@ class MojiOkoshiGUI:
     
     def wait_for_transcription_completion(self):
         """文字起こし処理の完了を待機"""
-        #print("DEBUG: 文字起こし完了待機開始")
-        while (self.mojiokoshi.audio_queue.qsize() > 0 or 
-                len(self.mojiokoshi.partial_audio_buffer) > 0 or
-                self.mojiokoshi.processing_progress['current_stage'] == 'transcribing'):
-            
-            # 進行状況を取得
+        while (
+            self.mojiokoshi.audio_queue.qsize() > 0 or
+            len(self.mojiokoshi.partial_audio_buffer) > 0 or
+            self.mojiokoshi.processing_progress['current_stage'] == 'transcribing'
+        ):
             progress = self.mojiokoshi.get_progress_percentage()
             stage = self.mojiokoshi.processing_progress['current_stage']
             processed = self.mojiokoshi.processing_progress['processed_items']
             total = self.mojiokoshi.processing_progress['total_items']
-            
+
             print(f"DEBUG: 進行状況 - {stage}: {processed}/{total} ({progress}%)")
-            
-            # UIを更新
+
             if stage == 'transcribing':
-                self.root.after(0, lambda p=progress, s=stage: self.transcription_status_label.config(
-                    text=f"文字起こし中... {p}%", fg="orange"))
+                self.root.after(
+                    0,
+                    lambda p=progress: self.transcription_status_label.config(
+                        text=f"文字起こし中... {p}%", fg="orange"
+                    )
+                )
             elif stage == 'saving':
-                self.root.after(0, lambda: self.transcription_status_label.config(
-                    text="保存中...", fg="blue"))
-            
-            time.sleep(0.5)  # 0.5秒待機
+                self.root.after(
+                    0,
+                    lambda: self.transcription_status_label.config(
+                        text="保存中...", fg="blue"
+                    )
+                )
+
+            time.sleep(0.5)
         
         # 完了メッセージを表示
         self.root.after(0, lambda: self.transcription_status_label.config(
@@ -366,12 +373,20 @@ class MojiOkoshiGUI:
     
     def reset_ui(self):
         """UIをリセット"""
-        # 録音開始ボタンを元の状態に戻す
-        self.start_button.config(text="録音開始", bg="#4CAF50", fg="black",
-                                activebackground="#45a049", activeforeground="black")
-        # 録音停止ボタンを元の状態に戻す
-        self.stop_button.config(state="normal", text="録音停止", bg="#f44336", fg="black",
-                                activebackground="#da190b", activeforeground="black")
+        try:
+            if self.start_button.winfo_exists():
+                self.start_button.config(
+                    text="録音開始", bg="#4CAF50", fg="black",
+                    activebackground="#45a049", activeforeground="black"
+                )
+            if self.stop_button.winfo_exists():
+                self.stop_button.config(
+                    state="normal", text="録音停止", bg="#f44336", fg="black",
+                    activebackground="#da190b", activeforeground="black"
+                )
+        except tk.TclError:
+            return
+
         self.is_recording = False
 
     def update_progress(self):

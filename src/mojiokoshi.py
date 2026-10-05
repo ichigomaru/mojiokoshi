@@ -7,20 +7,20 @@ import queue
 import os
 import tkinter as tk
 from tkinter import messagebox
-import datetime  # <-- 追加
-import soundfile as sf  # <-- 追加
-# pydubのインポートは不要
+import datetime  
+import soundfile as sf 
+
 
 # ----- 設定項目 -----
 RECORD_SEC = 5            # 5秒ごとの分割録音
 BUFFER_SEC = 60           # 60秒分貯まったらキューに送る
-SAMPLE_RATE = 16000       # 録音時サンプルレート
+SAMPLE_RATE = 48000       # 録音時サンプルレート
 TARGET_SR = 16000         # Whisper用サンプルレート
 NUM_CHANNEL = 3
 VOLUME = 1.3
-MODEL_SIZE = "medium"     # whisperモデルサイズ
+MODEL_SIZE = "large"      # whisperモデルサイズ
 SD_DEVICE = "mojiokoshi"  # spot検索、オーディオデバイスの設定から変更可能
-LANGUAGE = "ja"          # Whisperの言語設定（例: "ja"、"en"）
+LANGUAGE = "ja"           # Whisperの言語設定（例: "ja"、"en"）
 
 class MojiOkoshi:
     def __init__(self):
@@ -37,23 +37,25 @@ class MojiOkoshi:
         self.transcription_lock = threading.Lock() 
         self.scenes = {}
         
-        # 録音データ保存用の設定
+        # WAV保存用
         self.voice_log_dir = os.path.join("log", "voice")
         os.makedirs(self.voice_log_dir, exist_ok=True)
         self.wav_writer = None
         self.current_wav_path = None
         
+        # 即時テキスト保存用
+        self.other_log_dir = os.path.join("log", "scenario_log", "other")
+        os.makedirs(self.other_log_dir, exist_ok=True)
+        self.current_text_log_path = None
         
-        # 未完成の録音ブロックを保持するバッファ
         self.partial_audio_buffer = []
-        self.blocksize = int(RECORD_SEC * SAMPLE_RATE)  # 1秒分のフレーム数
-        self.buffer_target_size = int(BUFFER_SEC * SAMPLE_RATE)  # 60秒分のフレーム数
+        self.blocksize = int(RECORD_SEC * SAMPLE_RATE) # 48k
+        self.buffer_target_size = int(BUFFER_SEC * SAMPLE_RATE) # 10秒分 (48k)
         
-        # 処理進行状況の追跡
         self.processing_progress = {
             'total_items': 0,
             'processed_items': 0,
-            'current_stage': 'idle'  # idle, transcribing, saving, completed
+            'current_stage': 'idle'
         }
 
 
@@ -63,130 +65,112 @@ class MojiOkoshi:
         if status:
             print(f"audio_callback status: {status}")
             
-        # 録音データをWAVファイルに書き込む
+        # --- 3ch -> 2ch へのミックスダウンを正しく実行 ---
         try:
             if self.wav_writer:
-                # indata は (frames, 3) の形状
-                
-                # Ch 0: マイク音声 (そのまま)
-                mic_channel = indata[:, 0]
-                
-                # Ch 1, 2: 仮想L, 仮想R を平均化してモノラルに
-                virtual_mono = np.mean(indata[:, 1:3], axis=1)
-                
-                # 2チャンネルのNumpy配列を作成
+                indata_t = indata.T
+
+                resampled_data_t = librosa.resample(indata_t, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
+                resampled_data = resampled_data_t.T
+
+                mic_channel = resampled_data[:, 0]
+                virtual_mono = np.mean(resampled_data[:, 1:3], axis=1)
+
                 output_data = np.stack((mic_channel, virtual_mono), axis=1)
-                
-                # 2チャンネルのデータをWAVに書き込む
                 self.wav_writer.write(output_data)
+                
         except Exception as e:
             print(f"WAVファイルへの書き込みエラー: {e}")
             
-        #print(f" データサイズ: {indata.shape}, フレーム数: {frames}")
-        
-        # データをバッファに追加
+        # 処理キューには 48kHz / 3ch のデータをそのまま渡す
         self.partial_audio_buffer.append(indata.copy())
         
-        # バッファが60秒分（buffer_target_size）に達したらキューに追加
         total_frames = sum(data.shape[0] for data in self.partial_audio_buffer)
         if total_frames >= self.buffer_target_size:
-            # バッファのデータを結合してキューに追加
             combined_data = np.concatenate(self.partial_audio_buffer, axis=0)
             self.audio_queue.put(combined_data)
-            print(f"60秒分のブロックをキューに追加 - 現在のキューサイズ: {self.audio_queue.qsize()}")
-            # バッファをクリア
+            print(f"{BUFFER_SEC}秒分のブロックをキューに追加 - 現在のキューサイズ: {self.audio_queue.qsize()}")
             self.partial_audio_buffer = []
-        # else:
-        #     print(f"DEBUG: データをバッファに蓄積中 - 現在のフレーム数: {total_frames}/{self.buffer_target_size} ({total_frames/self.buffer_target_size*100:.1f}%)")
 
     def transcribe_worker(self):
         processed_index = 0
-        #print("DEBUG: transcribe_worker開始")
         while not self.stop_flag.is_set() or not self.audio_queue.empty() or self.partial_audio_buffer:
-            #print(f"DEBUG: ループ開始 - stop_flag: {self.stop_flag.is_set()}, queue_empty: {self.audio_queue.empty()}, buffer_empty: {len(self.partial_audio_buffer) == 0}")
             try:
-                # stop_flagが設定されている場合は短いタイムアウトで待機
                 timeout = 0.5 if self.stop_flag.is_set() else 1.0
-                #print("DEBUG: キューからデータを取得中...")
-                data = self.audio_queue.get(timeout=timeout)
-                #print("DEBUG: データ取得成功")
+                data = self.audio_queue.get(timeout=timeout) # 48kHz / 3ch
+                # 終了シグナル (None) を受け取ったらワーカー終了
+                if data is None:
+                    self.audio_queue.task_done()
+                    print("[DEBUG] transcribe_worker: received None → exiting")
+                    break
                 try:
                     processed_index += 1
                     total_queue = processed_index + self.audio_queue.qsize()
                     print(f"処理開始 ({processed_index} / {total_queue})")
 
-                    # モノラル化
+                    # モノラル化 (np.meanが3chすべてを平均化してくれる)
                     if data.ndim > 1:
                         mono = np.mean(data, axis=1)
                     else:
                         mono = data.flatten()
 
-                    # 空データチェック
                     if mono.size == 0:
                         text = "[音声なし]"
-                        #print("DEBUG: 音声データが空です。プレースホルダーを追加します。")
                         self.text_results.append(text)
-                        self.add_transcription(text)
+                        self.add_transcription(text) # [音声なし] もログには残す
                         print(f"処理完了 ({processed_index} / {total_queue})")
                         continue
 
-                    # リサンプリング
+                    # リサンプリング (48kHz -> 16kHz)
                     resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
                     resampled = np.clip(resampled * VOLUME, -1.0, 1.0)
 
                     # Whisperで文字起こし
-                    #print(f"Whisper処理開始 ({processed_index} / {total_queue})")
                     try:
                         result = self.model.transcribe(resampled, language=LANGUAGE)
                         text = result["text"]
                         print(text)
                         self.text_results.append(text)
-                        self.add_transcription(text)
+                        self.add_transcription(text) # 成功したテキストをログに書く
                     except Exception as e:
-                        #print(f"DEBUG: Whisper処理中にエラー: {e}")
-                        # エラーが発生しても処理を継続
                         text = f"[文字起こしエラー: {str(e)[:50]}...]"
                         self.text_results.append(text)
-                        self.add_transcription(text)
+                        self.add_transcription(text) # エラー内容をログに書く
                     print(f"処理完了 ({processed_index} / {total_queue})")
                 finally:
                     self.audio_queue.task_done()
             except queue.Empty:
-                #print("DEBUG: キューが空（タイムアウト）")
-                # stop_flagが設定されていて、キューが空でバッファも空の場合は終了
                 if self.stop_flag.is_set() and self.audio_queue.empty() and len(self.partial_audio_buffer) == 0:
-                    #print("DEBUG: stop_flagが設定されていてキューとバッファが空なので終了")
                     break
                 continue
-        #print("DEBUG: transcribe_worker終了")
 
     def start(self):
-        #print("DEBUG: start()メソッド開始")
-        
         try:
             sd.default.device = SD_DEVICE
-            sd.default.samplerate = SAMPLE_RATE
-            sd.default.channels = NUM_CHANNEL
+            sd.default.samplerate = SAMPLE_RATE # 48000
+            sd.default.channels = NUM_CHANNEL # 3
 
-            # 録音ファイルの設定
+            now = datetime.datetime.now()
+            timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")
+
+            # --- WAVファイルの設定 (16kHz / 2ch) ---
             try:
-                now = datetime.datetime.now()
-                timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")
-                filename = now.strftime("%Y-%m-%d_%H-%M-%S") + ".wav"
-                self.current_wav_path = os.path.join(self.voice_log_dir, filename)
+                wav_filename = timestamp_str + ".wav"
+                self.current_wav_path = os.path.join(self.voice_log_dir, wav_filename)
                 
-                # 保存するWAVファイルは 2 チャンネルで作成
+                # 保存するWAVファイルは 2 チャンネル、16kHz (TARGET_SR) で作成
                 self.wav_writer = sf.SoundFile(
                     self.current_wav_path, 
                     mode='w', 
-                    samplerate=SAMPLE_RATE, # 16000
-                    channels=2              # 2チャンネル (Mic, Virtual Mono)
+                    samplerate=TARGET_SR, # 16000
+                    channels=2            # 2チャンネル (Mic, Virtual Mono)
                 )
                 print(f"録音データを {self.current_wav_path} に (2ch, 16kHzで) 保存開始...")
             except Exception as e:
                 print(f"録音ファイルの作成に失敗しました: {e}")
                 self.wav_writer = None
-
+            
+            # --- 即時テキストログファイルの設定 ---
             try:
                 text_filename = timestamp_str + ".txt"
                 self.current_text_log_path = os.path.join(self.other_log_dir, text_filename)
@@ -197,7 +181,7 @@ class MojiOkoshi:
                 print(f"即時ログファイルの作成に失敗しました: {e}")
                 self.current_text_log_path = None
 
-            blocksize = int(RECORD_SEC * SAMPLE_RATE)
+            blocksize = int(RECORD_SEC * SAMPLE_RATE) # 48000Hz基準
 
             self.stream = sd.InputStream(callback=self.audio_callback, blocksize=blocksize)
             self.stream.start()
@@ -207,12 +191,10 @@ class MojiOkoshi:
             self.thread.start()
         except Exception as e:
             print(f"録音開始エラー: {e}")
-            # --- vvv 変更点 vvv ---
-            # エラー発生時にファイルが開いていれば閉じる
             if self.wav_writer:
                 self.wav_writer.close()
                 self.wav_writer = None
-            # --- ^^^ 変更点 ^^^ ---
+            self.current_text_log_path = None
             raise
 
     def stop(self):
@@ -223,14 +205,12 @@ class MojiOkoshi:
             self.stream.close()
             print("録音ストリームを停止しました。")
             
-        # 録音ファイルを閉じる
         if self.wav_writer:
             try:
                 self.wav_writer.close()
                 print(f"WAVデータを {self.current_wav_path} に保存完了しました。")
             except Exception as e:
                 print(f"WAVファイルのクローズ中にエラーが発生しました: {e}")
-            
             self.wav_writer = None
             self.current_wav_path = None
 
@@ -249,7 +229,7 @@ class MojiOkoshi:
             print("文字起こしスレッドの終了を待機中...")
             self.thread.join()
             print("スレッドが正常に終了しました。")
-
+            
         if self.current_text_log_path:
             try:
                 with open(self.current_text_log_path, "a", encoding="utf-8") as f:
@@ -271,29 +251,28 @@ class MojiOkoshi:
         """現在の録音シーンを切り替える"""
         if not scene_title:
             print("⚠️ シーン名が空です。")
-            return False  # 切り替え不可
+            return False
 
-        # 重複チェック
         if scene_title in self.scene_transcriptions:
             print(f"⚠️ シーン名 '{scene_title}' は既に存在します。別の名前を入力してください。")
             return False
 
-        # ★前シーンの未処理バッファとキューをバックグラウンドで文字起こしして反映
         prev_scene = self.current_scene
-        # Deep copy buffer and queue items for async processing
-        # 未処理のバッファとキューのデータを取得
         old_buffer = self.partial_audio_buffer
+        old_queue_items = []
+        while not self.audio_queue.empty():
+            try:
+                old_queue_items.append(self.audio_queue.get_nowait())
+            except queue.Empty:
+                break
         old_queue = self.audio_queue
 
-        # 新しいキューとバッファをアトミックに設定
         self.partial_audio_buffer = []
-        self.audio_queue = queue.Queue()
+        #self.audio_queue = queue.Queue()
         
-        # 新しいシーンに切り替え
         self.current_scene = scene_title
         self.scene_transcriptions[scene_title] = []
 
-        # 古いデータがあればバックグラウンド処理を開始
         if old_buffer or not old_queue.empty():
             queue_items = []
             while not old_queue.empty():
@@ -313,19 +292,24 @@ class MojiOkoshi:
         return True
 
     def add_transcription(self, text: str):
-        """文字起こし結果を現在のシーンに追加"""
-        if self.current_scene not in self.scene_transcriptions:
-            self.scene_transcriptions[self.current_scene] = []
-        self.scene_transcriptions[self.current_scene].append(text)
+        """文字起こし結果を現在のシーンに追加 (および即時ログに追記)"""
+        
+        # 1. GUI用のシーンリストに追加
+        with self.transcription_lock:
+            if self.current_scene not in self.scene_transcriptions:
+                self.scene_transcriptions[self.current_scene] = []
+            self.scene_transcriptions[self.current_scene].append(text)
+        
         print(f"シーン '{self.current_scene}' にテキストを追加: '{text[:50]}...'")
-
+        
+        # 2. 即時テキストログへの追記
         if self.current_text_log_path:
             try:
                 # "a" (append) モードでファイルを開き、テキストを追記
                 with open(self.current_text_log_path, "a", encoding="utf-8") as f:
                     f.write(text + "\n")
             except Exception as e:
-                print(f"ログファイルへの書き込みエラー: {e}")
+                print(f"即時ログファイルへの書き込みエラー: {e}")
     
     def update_progress(self, stage: str, processed: int = None, total: int = None):
         """処理進行状況を更新"""
@@ -346,15 +330,16 @@ class MojiOkoshi:
         全シーンの文字起こしを保存
         - 各シーンの.txtを log/output/ フォルダ内に保存
         """
-        # 保存先ディレクトリ
         if output_dir is None:
             output_dir = os.path.join("log", "output")
         os.makedirs(output_dir, exist_ok=True)
         self.scenes = {}
 
-        for scene, texts in self.scene_transcriptions.items():
-            # 空のシーン（テキストが空または空リスト）をスキップ
-            clean_texts = [t for t in texts if t.strip()]  # 空文字を除外
+        with self.transcription_lock:
+            scene_data_copy = {scene: list(texts) for scene, texts in self.scene_transcriptions.items()}
+
+        for scene, texts in scene_data_copy.items():
+            clean_texts = [t for t in texts if t.strip()]
             if not clean_texts:
                 print(f"シーン '{scene}' は空なのでスキップします。")
                 continue
@@ -363,7 +348,6 @@ class MojiOkoshi:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(clean_texts))
             print(f"💾 保存完了: {file_path}")
-            # scenesに追加
             self.scenes[scene] = "\n".join(clean_texts)
 
     @property
@@ -372,29 +356,23 @@ class MojiOkoshi:
     
     def get_initial_scene_name(self, parent_window=None):
         """最初のシーン名を入力するダイアログを表示"""
-        # ダイアログウィンドウを作成
         dialog = tk.Toplevel(parent_window) if parent_window else tk.Tk()
         dialog.title("シーン名を入力")
         dialog.geometry("400x150")
         dialog.resizable(False, False)
         
-        # メインウィンドウを一時的に無効化
         if parent_window:
             dialog.transient(parent_window)
             dialog.grab_set()
-            # ダイアログを中央に配置
             dialog.geometry("+%d+%d" % (parent_window.winfo_rootx() + 50, parent_window.winfo_rooty() + 50))
         
-        # ラベル
         label = tk.Label(dialog, text="最初のシーン名を入力してください:", font=("Arial", 12))
         label.pack(pady=20)
         
-        # 入力フィールド
         entry = tk.Entry(dialog, width=30, font=("Arial", 11))
         entry.pack(pady=10)
-        entry.focus()  # フォーカスを設定
+        entry.focus()
         
-        # ボタンフレーム
         button_frame = tk.Frame(dialog)
         button_frame.pack(pady=10)
         
@@ -410,26 +388,19 @@ class MojiOkoshi:
                 messagebox.showwarning("警告", "シーン名を入力してください。")
         
         def on_cancel():
-            # デフォルトシーンを使用
             result["scene_name"] = "default"
             self.switch_scene("default")
             dialog.destroy()
         
-        # OKボタン
         ok_button = tk.Button(button_frame, text="OK", command=on_ok, width=10)
         ok_button.pack(side=tk.LEFT, padx=5)
         
-        # キャンセルボタン
         cancel_button = tk.Button(button_frame, text="デフォルト", command=on_cancel, width=10)
         cancel_button.pack(side=tk.LEFT, padx=5)
         
-        # EnterキーでOK
         entry.bind('<Return>', lambda e: on_ok())
-        
-        # Escapeキーでキャンセル
         dialog.bind('<Escape>', lambda e: on_cancel())
         
-        # ダイアログが閉じられるまで待機
         if parent_window:
             dialog.wait_window()
         else:
@@ -440,14 +411,12 @@ class MojiOkoshi:
     def save_combined_scenario(self, scenario_title, output_dir=None):
         """
         全シーンをまとめて1つのテキストファイルに保存。
-        シーンごとにヘッダを付けて連結し、各文ごとに適切な改行を挿入。
         - 結合テキストは log/scenario_log/ フォルダ内に保存
         """
         if not self.scenes:
             print("DEBUG: scenesが空です。save_all_scenes()を先に呼んでください。")
             return None
 
-        # 保存先ディレクトリ
         if output_dir is None:
             output_dir = os.path.join("log", "scenario_log")
         os.makedirs(output_dir, exist_ok=True)
@@ -459,7 +428,6 @@ class MojiOkoshi:
         with open(combined_file_path, "w", encoding="utf-8") as f:
             for idx, (scene_name, text) in enumerate(self.scenes.items()):
                 f.write(f"【{scene_name}】\n")
-                # シーンテキストを行ごとに分割し、各文末で改行を挿入
                 lines = text.splitlines()
                 for line in lines:
                     line = line.rstrip()
@@ -470,7 +438,6 @@ class MojiOkoshi:
                         f.write("\n\n")
                     else:
                         f.write("\n")
-                # シーン間は3つの改行で区切る
                 f.write("\n\n\n")
 
         print(f"全シーン結合テキスト保存完了: {combined_file_path}")
@@ -478,7 +445,6 @@ class MojiOkoshi:
     
     def process_partial_buffer_for_scene(self):
         """現在のシーンに対して、未処理バッファとキューのデータを文字起こしして追加"""
-        # バッファを処理
         if self.partial_audio_buffer:
             combined_data = np.concatenate(self.partial_audio_buffer, axis=0)
             mono = np.mean(combined_data, axis=1) if combined_data.ndim > 1 else combined_data.flatten()
@@ -488,13 +454,12 @@ class MojiOkoshi:
                 try:
                     result = self.model.transcribe(resampled, language=LANGUAGE)
                     text = result["text"]
-                    self.add_transcription(text)
+                    self.add_transcription(text) # このテキストも即時ログに追記される
                 except Exception as e:
                     text = f"[文字起こしエラー: {str(e)[:50]}...]"
-                    self.add_transcription(text)
+                    self.add_transcription(text) # エラーも追記
             self.partial_audio_buffer = []
 
-        # キューを処理
         while not self.audio_queue.empty():
             try:
                 data = self.audio_queue.get_nowait()
@@ -505,45 +470,64 @@ class MojiOkoshi:
                     try:
                         result = self.model.transcribe(resampled, language=LANGUAGE)
                         text = result["text"]
-                        self.add_transcription(text)
+                        self.add_transcription(text) # このテキストも即時ログに追記される
                     except Exception as e:
                         text = f"[文字起こしエラー: {str(e)[:50]}...]"
-                        self.add_transcription(text)
+                        self.add_transcription(text) # エラーも追記
                 self.audio_queue.task_done()
             except queue.Empty:
                 break
+    
     def process_scene_async(self, scene_name, buffer_data, queue_data):
-        """バックグラウンドでシーンのバッファとキューを文字起こしして追加"""
+        """
+        バックグラウンドで(古い)シーンのバッファとキューを文字起こしして追加
+        (メモ: これは古いシーンの残りデータ用なので、即時ログには追記しない)
+        """
         texts_to_add = []
         
-        # バッファデータ処理
         if buffer_data:
             try:
                 combined_data = np.concatenate(buffer_data, axis=0)
                 mono = np.mean(combined_data, axis=1) if combined_data.ndim > 1 else combined_data.flatten()
-                if mono.size > 0:
+                if mono.size == 0:
+                    pass
+                elif mono.size < TARGET_SR * 0.02:  # ★ 追加
+                    pass
+                else:
                     resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
                     resampled = np.clip(resampled * 1.3, -1.0, 1.0)
-                    result = self.model.transcribe(resampled, language=LANGUAGE)
-                    texts_to_add.append(result["text"])
+                    if len(resampled) < 320:
+                        pass
+                    else:
+                        result = self.model.transcribe(resampled, language=LANGUAGE)
+                        texts_to_add.append(result["text"])
             except Exception as e:
                 texts_to_add.append(f"[文字起こしエラー: {str(e)[:50]}...]")
                 print(f"[バックグラウンドバッファ処理エラー: {e}]")
 
-        # キューデータ処理
         for data in queue_data:
             try:
                 mono = np.mean(data, axis=1) if data.ndim > 1 else data.flatten()
-                if mono.size > 0:
-                    resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
-                    resampled = np.clip(resampled * 1.3, -1.0, 1.0)
-                    result = self.model.transcribe(resampled, language=LANGUAGE)
-                    texts_to_add.append(result["text"])
+                
+                if mono.size == 0:
+                    continue
+                
+                if mono.size < TARGET_SR * 0.02:
+                    continue
+
+                resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
+                resampled = np.clip(resampled * 1.3, -1.0, 1.0)
+
+                if len(resampled) < 320:
+                    continue
+
+                result = self.model.transcribe(resampled, language=LANGUAGE)
+                texts_to_add.append(result["text"])
+
             except Exception as e:
                 texts_to_add.append(f"[文字起こしエラー: {str(e)[:50]}...]")
                 print(f"[バックグラウンドキュー処理エラー: {e}]")
 
-        # スレッドセーフに文字起こし結果を更新
         if texts_to_add:
             with self.transcription_lock:
                 if scene_name not in self.scene_transcriptions:
