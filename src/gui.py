@@ -4,11 +4,11 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
 
 import customtkinter as ctk
 
 from mojiokoshi import MojiOkoshi, LANGUAGE
+import fusetter
 
 # --- 見た目の設定 (ハードウェア風。配色が前提なのでライト固定) ---
 ctk.set_appearance_mode("light")
@@ -229,6 +229,15 @@ class MojiOkoshiGUI:
         entry.bind("<Return>", lambda e: on_ok())
         dialog.bind("<Escape>", lambda e: on_secondary() if secondary_text else dialog.destroy())
 
+        self._run_modal(dialog, entry)
+        return result["action"], result["text"]
+
+    def _run_modal(self, dialog, focus_widget):
+        """
+        ダイアログを前面に出して閉じるまで待つ。
+        メイン画面は -topmost なので、開いている間だけ外してダイアログを -topmost にする
+        (macOS では transient を付けると -topmost が効かないので付けない)。
+        """
         self.root.update_idletasks()
         dialog.geometry("+%d+%d" % (self.root.winfo_rootx() + 40, self.root.winfo_rooty() + 60))
         parent_was_topmost = bool(self.root.attributes("-topmost"))
@@ -241,10 +250,45 @@ class MojiOkoshiGUI:
         except tk.TclError:
             pass
         dialog.focus_force()
-        entry.focus_set()
+        focus_widget.focus_set()
         dialog.wait_window()
-        self.root.attributes("-topmost", parent_was_topmost)
-        return result["action"], result["text"]
+        try:
+            self.root.attributes("-topmost", parent_was_topmost)
+        except tk.TclError:
+            pass
+
+    def show_message(self, title, message, buttons=(("OK", "ok"),)):
+        """
+        メッセージとボタンのダイアログを出し、押されたボタンの値を返す (× で閉じたら None)。
+        macOS 26 では tkinter.messagebox (標準ダイアログ) を閉じたあとにアプリが落ちるので、こちらを使う。
+        buttons: ((表示名, 値), ...)。最後のボタンがオレンジの主ボタンになる。
+        """
+        dialog = ctk.CTkToplevel(self.root, fg_color=BODY)
+        dialog.title(title)
+        dialog.resizable(False, False)
+        dialog.grid_columnconfigure(tuple(range(len(buttons))), weight=1, uniform="btn")
+        result = {"value": None}
+
+        ctk.CTkLabel(dialog, text=message, font=self.font_body, text_color=INK, justify="left",
+                     anchor="w", wraplength=360).grid(
+            row=0, column=0, columnspan=len(buttons), sticky="w", padx=18, pady=(18, 14))
+
+        def choose(value):
+            result["value"] = value
+            dialog.destroy()
+
+        main_button = None
+        for i, (label, value) in enumerate(buttons):
+            primary = i == len(buttons) - 1
+            b = self._key_button(dialog, label, lambda v=value: choose(v), primary=primary, width=110)
+            b.grid(row=1, column=i, sticky="ew", padx=(18 if i == 0 else 5, 18 if primary else 5), pady=(0, 16))
+            if primary:
+                main_button = b
+        dialog.bind("<Return>", lambda e: choose(buttons[-1][1]))
+        dialog.bind("<Escape>", lambda e: choose(buttons[0][1] if len(buttons) > 1 else buttons[-1][1]))
+
+        self._run_modal(dialog, main_button)
+        return result["value"]
 
     def ask_initial_scene_name(self):
         """最初のシーン名を入力 (「デフォルト」なら default)"""
@@ -286,7 +330,7 @@ class MojiOkoshiGUI:
             self.scene_warning_label.configure(text="")
             self._warning_shown = False
         # If empty or stopping, disable button
-        if not scene_title or self.state == "stopping":
+        if not scene_title or self.state in ("stopping", "posting"):
             self.switch_scene_button.configure(state="disabled")
             return
         if scene_title in self.mojiokoshi.scene_transcriptions:
@@ -323,7 +367,7 @@ class MojiOkoshiGUI:
         self.current_scene_label.configure(text=scene_name)
 
     def switch_scene(self):
-        if self.state == "stopping":
+        if self.state in ("stopping", "posting"):
             self._show_warning("停止処理中は切り替えられません")
             return
         scene_title = self.scene_title_entry.get().strip()
@@ -360,7 +404,7 @@ class MojiOkoshiGUI:
             # start() はすぐ戻るので、UIスレッドで直接呼んでエラーをその場で表示する
             self.mojiokoshi.start()
         except Exception as e:
-            messagebox.showerror("エラー", f"録音を開始できませんでした: {e}")
+            self.show_message("エラー", f"録音を開始できませんでした: {e}")
             return
         self.state = "recording"
         self.record_started_at = time.time()
@@ -406,19 +450,18 @@ class MojiOkoshiGUI:
                 self.root.after(200, check_done)
                 return
             if "error" in stop_result:
-                messagebox.showerror("エラー", f"処理中にエラーが発生しました: {stop_result['error']}")
+                self.show_message("エラー", f"処理中にエラーが発生しました: {stop_result['error']}")
                 self.reset_ui()
                 return
             if self.mojiokoshi.last_stop_skipped:
                 self._set_status("文字起こしはスキップしました", ORANGE)
                 reason = ("モデルを読み込めなかったため" if self.mojiokoshi.model_error
                           else "モデルの読み込みが終わる前に停止したため")
-                messagebox.showinfo(
+                self.show_message(
                     "文字起こしなし",
                     f"{reason}、文字起こしはしませんでした。\n"
                     + (f"録音は {self.mojiokoshi.last_wav_path} に保存されています。"
-                       if self.mojiokoshi.last_wav_path else "録音(WAV)も保存できませんでした。"),
-                    parent=self.root
+                       if self.mojiokoshi.last_wav_path else "録音(WAV)も保存できませんでした。")
                 )
                 self.reset_ui()
                 return
@@ -461,18 +504,108 @@ class MojiOkoshiGUI:
                 filename = os.path.join("log", "scenario_log", f"{final_title}.txt")
                 with open(filename, "w", encoding="utf-8") as f:
                     f.write(formatted_text)
-                print(f"シナリオファイルを {filename} に保存しました。アプリを終了します。")
+                print(f"シナリオファイルを {filename} に保存しました。")
 
-                # 保存したらそのまま終了する
-                self.root.quit()  # mainloopを終了
-                self.root.destroy()  # ウィンドウを破棄
-                sys.exit(0)  # プロセスを終了
+                if self.show_message("ふせったー", "ふせったーに投稿しますか？",
+                                     buttons=(("いいえ", "no"), ("はい", "yes"))) == "yes":
+                    self.start_fusetter_post(final_title, formatted_text)
+                    return
+                # 投稿しないなら、保存したらそのまま終了する
+                self.quit_app()
             else:
-                messagebox.showwarning("未入力", "シナリオタイトルが入力されませんでした。UIをリセットします。")
+                self.show_message("未入力", "シナリオタイトルが入力されませんでした。UIをリセットします。")
                 self.reset_ui()
         except Exception as e:
             print(f"DEBUG: show_completion_messageでエラー: {e}")
+            self.show_message("エラー", f"保存・投稿の準備中にエラーが発生しました: {e}")
             self.reset_ui()
+
+    def quit_app(self):
+        print("アプリを終了します。")
+        self.root.quit()  # mainloopを終了
+        self.root.destroy()  # ウィンドウを破棄
+        sys.exit(0)  # プロセスを終了
+
+    # ------------------------------------------------------------------
+    # ふせったーへの投稿
+    # ------------------------------------------------------------------
+    def start_fusetter_post(self, title, log_text):
+        """
+        ふせったーに投稿し、Discord に URL を送ってから終了する。
+        失敗したらやり直せる (投稿済みの分は飛ばす)。
+        """
+        self.state = "posting"
+        self.record_button.configure(state="disabled", text="…", fg_color=TRACK)
+        self.update_switch_scene_button_state()
+        self.update_record_status()
+        posted = []          # 投稿できた (タイトル, URL)。やり直しても消さない
+        progress = {"status": "", "done": False, "error": None, "discord_done": False,
+                    "discord_sent": 0, "no_webhook": False}
+
+        def run():
+            progress.update(done=False, error=None)
+            try:
+                fusetter.post_to_fusetter(
+                    title, log_text, start=len(posted),
+                    on_status=lambda text: progress.update(status=text),
+                    on_posted=lambda i, t, url: posted.append((t, url)))
+                if not progress["discord_done"]:
+                    webhook = fusetter.load_webhook_url()
+                    if webhook:
+                        progress["status"] = "Discord に送信中…"
+                        # やり直しのときは送信済みのメッセージを飛ばす
+                        fusetter.send_discord(webhook, posted, skip=progress["discord_sent"],
+                                              on_sent=lambda n: progress.update(discord_sent=n))
+                    else:
+                        print("config.local.json に Discord の Webhook URL が無いので、Discord への送信はスキップします。")
+                        progress["no_webhook"] = True
+                    progress["discord_done"] = True
+            except Exception as e:
+                print(f"ふせったー投稿エラー: {e}")
+                progress["error"] = str(e)
+                progress["unconfirmed"] = getattr(e, "unconfirmed", False)
+                progress["unconfirmed_title"] = getattr(e, "title", "")
+            progress["done"] = True
+
+        def start_thread():
+            threading.Thread(target=run, daemon=True).start()
+            self.root.after(300, poll)
+
+        def poll():
+            try:
+                if progress["status"]:
+                    self._set_status(progress["status"])
+            except Exception as e:  # 表示の更新に失敗しても見張りは止めない
+                print(f"DEBUG: 投稿状況の表示エラー: {e}")
+            if not progress["done"]:
+                self.root.after(300, poll)
+                return
+            if progress["error"]:
+                done_text = f"\n\n投稿済み: {', '.join(t for t, _ in posted)}" if posted else ""
+                if progress.get("unconfirmed"):
+                    # 投稿ボタンは押したが完了を確認できなかった。二重投稿を防ぐため人に確かめてもらう
+                    message = (f"「{progress['unconfirmed_title']}」を投稿できたか確認できませんでした。{done_text}\n\n"
+                               "ふせったーのマイページを確認してください。\n"
+                               "投稿されていなければ「再試行」、投稿されていれば「キャンセル」で終了します(ログは保存済みです)。")
+                else:
+                    message = (f"投稿できませんでした。\n{progress['error']}{done_text}\n\n"
+                               "「再試行」で続きから投稿します。「キャンセル」で終了します(ログは保存済みです)。")
+                retry = self.show_message("ふせったー", message,
+                                          buttons=(("キャンセル", "cancel"), ("再試行", "retry"))) == "retry"
+                if retry:
+                    start_thread()
+                else:
+                    self.quit_app()
+                return
+            for t, url in posted:
+                print(f"ふせったーに投稿しました: {t} {url}")
+            if progress["no_webhook"]:
+                self.show_message("Discord", "ふせったーには投稿しました。\n"
+                                  "Discord の設定 (config.local.json の discord_webhook_url) が見つからないので、"
+                                  "通知は送りませんでした。")
+            self.quit_app()
+
+        start_thread()
 
     def reset_ui(self):
         """UIをリセット"""
@@ -499,6 +632,8 @@ class MojiOkoshiGUI:
                                        text_color=ORANGE)
         elif self.state == "stopping":
             self.record_status_label.configure(text="PROCESSING", text_color=DISPLAY_TEXT)
+        elif self.state == "posting":
+            self.record_status_label.configure(text="POSTING", text_color=DISPLAY_TEXT)
         else:
             self.record_status_label.configure(text="STANDBY", text_color=DISPLAY_MUTED)
             self.timer_label.configure(text_color=DISPLAY_MUTED)
@@ -531,7 +666,7 @@ class MojiOkoshiGUI:
             self.model_status_label.configure(text="MODEL ✕ ERROR", text_color=ORANGE)
             if not self._model_error_shown:
                 self._model_error_shown = True
-                messagebox.showerror("エラー", f"Whisperモデルを読み込めませんでした: {m.model_error}\n録音(WAV)は保存できますが、文字起こしはできません。")
+                self.show_message("エラー", f"Whisperモデルを読み込めませんでした: {m.model_error}\n録音(WAV)は保存できますが、文字起こしはできません。")
 
     def run(self):
         self.root.mainloop()

@@ -10,3 +10,6 @@ icons/
 
 # Virtual environments
 .venv
+
+# 個人設定 (Discord Webhook URL など)
+config.local.json
