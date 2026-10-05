@@ -1,5 +1,4 @@
 import threading
-import time
 import tkinter as tk
 from tkinter import ttk
 # --- vvv 変更点 vvv ---
@@ -44,8 +43,8 @@ class MojiOkoshiGUI:
         self.root.title("MojiOkoshi")
 
         self.mojiokoshi = MojiOkoshi()
-        self.recording_thread = None
-        self.is_recording = False
+        # "idle"(待機) / "recording"(録音中) / "stopping"(停止処理中)
+        self.state = "idle"
         self.root.attributes("-topmost", True) 
 
         # Scene title input
@@ -138,8 +137,8 @@ class MojiOkoshiGUI:
         # Remove any previous warning label if present
         if hasattr(self, "_scene_warning_label") and self._scene_warning_label.winfo_exists():
             self._scene_warning_label.destroy()
-        # If empty, disable button and clear warning
-        if not scene_title:
+        # If empty or stopping, disable button
+        if not scene_title or self.state == "stopping":
             self.switch_scene_button.config(state="disabled")
             return
         # Use MojiOkoshi's check for duplicate
@@ -187,6 +186,9 @@ class MojiOkoshiGUI:
         #print(f"DEBUG: シーン履歴に追加: {history_entry}")
 
     def switch_scene(self):
+        if self.state == "stopping":
+            messagebox.showwarning("警告", "停止処理中はシーンを切り替えられません。")
+            return
         scene_title = self.scene_title_entry.get().strip()
         if not scene_title:
             messagebox.showwarning("警告", "シーン名が空です。シーン名を入力してください。")
@@ -207,102 +209,67 @@ class MojiOkoshiGUI:
         self.update_switch_scene_button_state()
 
     def start_recording(self):
-        if not self.is_recording:
-            self.is_recording = True
-            # ボタンの見た目を変更（録音中状態）
-            self.start_button.config(text="● REC", bg="#E91E63", fg="red", 
-                                    activebackground="#cc0000", activeforeground="black")
-            self.stop_button.config(state="normal")
-            
-            # Start the MojiOkoshi recording in a separate thread
-            self.recording_thread = threading.Thread(target=self.mojiokoshi.start)
-            self.recording_thread.daemon = True
-            self.recording_thread.start()
+        if self.state != "idle":
+            return
+        try:
+            # start() はすぐ戻るので、UIスレッドで直接呼んでエラーをその場で表示する
+            self.mojiokoshi.start()
+        except Exception as e:
+            messagebox.showerror("エラー", f"録音を開始できませんでした: {e}")
+            return
+        self.state = "recording"
+        # ボタンの見た目を変更（録音中状態）
+        self.start_button.config(text="● REC", bg="#E91E63", fg="red", 
+                                activebackground="#cc0000", activeforeground="black",
+                                state="disabled")
+        self.stop_button.config(state="normal")
+        self.transcription_status_label.config(text="")
 
     def stop_recording(self):
-        if self.is_recording:
-            self.is_recording = False
-            self.mojiokoshi.audio_queue.put(None)
-            self.stop_button.config(state="disabled", text="処理中...")
-            
-            # 録音停止処理を別スレッドで実行（UIをブロックしないため）
-            def stop_and_save():
-                try:
-                    print("DEBUG: GUI停止処理開始")
-                    
-                    # 録音を停止
-                    self.mojiokoshi.stop()
-                    print("DEBUG: mojiokoshi.stop()完了")
-                    
-                    if self.recording_thread is not None:
-                        #print("DEBUG: recording_thread.join()開始")
-                        self.recording_thread.join(timeout=5)
-                        #print("DEBUG: recording_thread.join()完了")
-                    
-                    # キューにデータが残っているかチェック
-                    queue_size = self.mojiokoshi.audio_queue.qsize()
-                    buffer_size = len(self.mojiokoshi.partial_audio_buffer)
-                    if queue_size > 0 or buffer_size > 0:
-                        # 文字起こし処理の完了を待機
-                        self.wait_for_transcription_completion()
-                    
-                    # 保存処理
-                    #print("DEBUG: save_all_scenes()開始")
-                    self.mojiokoshi.save_all_scenes()
-                    # After saving, ensure self.mojiokoshi.scenes is populated from scene_transcriptions
-                    if hasattr(self.mojiokoshi, "scene_transcriptions"):
-                        self.mojiokoshi.scenes = dict(self.mojiokoshi.scene_transcriptions)
-                    #print("DEBUG: save_all_scenes()完了")
-                    
-                    # 完了メッセージを表示
-                    #print("DEBUG: 完了メッセージ表示開始")
-                    self.root.after(0, self.show_completion_message)
-                    #print("DEBUG: 完了メッセージ表示完了")
-                    
-                except Exception as e:
-                    print(f"エラーが発生しました: {e}")
-                    self.root.after(0, lambda: messagebox.showerror("エラー", f"処理中にエラーが発生しました: {e}"))
-                    self.root.after(0, self.reset_ui)
-            
-            # 停止処理を別スレッドで実行
-            stop_thread = threading.Thread(target=stop_and_save, daemon=True)
-            stop_thread.start()
-    
-    def wait_for_transcription_completion(self):
-        """文字起こし処理の完了を待機"""
-        while (
-            self.mojiokoshi.audio_queue.qsize() > 0 or
-            len(self.mojiokoshi.partial_audio_buffer) > 0 or
-            self.mojiokoshi.processing_progress['current_stage'] == 'transcribing'
-        ):
-            progress = self.mojiokoshi.get_progress_percentage()
-            stage = self.mojiokoshi.processing_progress['current_stage']
-            processed = self.mojiokoshi.processing_progress['processed_items']
-            total = self.mojiokoshi.processing_progress['total_items']
-
-            print(f"DEBUG: 進行状況 - {stage}: {processed}/{total} ({progress}%)")
-
-            if stage == 'transcribing':
-                self.root.after(
-                    0,
-                    lambda p=progress: self.transcription_status_label.config(
-                        text=f"文字起こし中... {p}%", fg="orange"
-                    )
-                )
-            elif stage == 'saving':
-                self.root.after(
-                    0,
-                    lambda: self.transcription_status_label.config(
-                        text="保存中...", fg="blue"
-                    )
-                )
-
-            time.sleep(0.5)
+        if self.state != "recording":
+            return
+        self.state = "stopping"
+        self.stop_button.config(state="disabled", text="処理中...")
+        self.update_switch_scene_button_state()
+        self.transcription_status_label.config(text="残りの音声を文字起こし中...", fg="orange")
         
-        # 完了メッセージを表示
-        self.root.after(0, lambda: self.transcription_status_label.config(
-            text="文字起こし完了！", fg="green"))
-        #print("DEBUG: 文字起こし完了")
+        # 録音停止処理を別スレッドで実行（UIをブロックしないため）
+        # Tk はメインスレッドからしか触らないので、スレッドは結果を残すだけにする
+        stop_result = {}
+
+        def stop_and_save():
+            try:
+                print("DEBUG: GUI停止処理開始")
+
+                # 録音を停止 (残りの文字起こしが終わるまで戻らない)
+                self.mojiokoshi.stop()
+                print("DEBUG: mojiokoshi.stop()完了")
+
+                # 保存処理
+                self.mojiokoshi.save_all_scenes()
+                # After saving, ensure self.mojiokoshi.scenes is populated from scene_transcriptions
+                if hasattr(self.mojiokoshi, "scene_transcriptions"):
+                    self.mojiokoshi.scenes = dict(self.mojiokoshi.scene_transcriptions)
+            except Exception as e:
+                print(f"エラーが発生しました: {e}")
+                stop_result["error"] = str(e)
+
+        stop_thread = threading.Thread(target=stop_and_save, daemon=True)
+        stop_thread.start()
+
+        def check_done():
+            if stop_thread.is_alive():
+                self.root.after(200, check_done)
+                return
+            if "error" in stop_result:
+                messagebox.showerror("エラー", f"処理中にエラーが発生しました: {stop_result['error']}")
+                self.reset_ui()
+                return
+            self.transcription_status_label.config(text="文字起こし完了！", fg="green")
+            # 完了メッセージを表示
+            self.show_completion_message()
+
+        self.root.after(200, check_done)
 
     def show_completion_message(self):
         """完了メッセージを表示してシナリオまとめファイル作成"""
@@ -377,17 +344,19 @@ class MojiOkoshiGUI:
             if self.start_button.winfo_exists():
                 self.start_button.config(
                     text="録音開始", bg="#4CAF50", fg="black",
-                    activebackground="#45a049", activeforeground="black"
+                    activebackground="#45a049", activeforeground="black",
+                    state="normal"
                 )
             if self.stop_button.winfo_exists():
                 self.stop_button.config(
-                    state="normal", text="録音停止", bg="#f44336", fg="black",
+                    state="disabled", text="録音停止", bg="#f44336", fg="black",
                     activebackground="#da190b", activeforeground="black"
                 )
         except tk.TclError:
             return
 
-        self.is_recording = False
+        self.state = "idle"
+        self.update_switch_scene_button_state()
 
     def update_progress(self):
         """

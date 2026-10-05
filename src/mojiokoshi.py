@@ -12,7 +12,7 @@ import soundfile as sf
 
 
 # ----- 設定項目 -----
-RECORD_SEC = 5            # 5秒ごとの分割録音
+RECORD_SEC = 1            # 1秒ごとの分割録音 (シーン切り替え・停止の区切り精度)
 BUFFER_SEC = 60           # 60秒分貯まったらキューに送る
 SAMPLE_RATE = 48000       # 録音時サンプルレート
 TARGET_SR = 16000         # Whisper用サンプルレート
@@ -28,13 +28,18 @@ class MojiOkoshi:
         self.model = whisper.load_model(MODEL_SIZE)
         print("モデル読み込み完了")
 
+        # キューの中身は (シーン名, 音声データ) か、終了の合図の None
         self.audio_queue = queue.Queue()
         self.text_results = []
         self.stop_flag = threading.Event()
         self.thread = None
+        self.stream = None
+        self.is_running = False
         self.current_scene = "default"
         self.scene_transcriptions = {}
-        self.transcription_lock = threading.Lock() 
+        self.transcription_lock = threading.Lock()
+        # partial_audio_buffer と current_scene を録音コールバックと他スレッドで共有するためのロック
+        self.buffer_lock = threading.Lock()
         self.scenes = {}
         
         # WAV保存用
@@ -83,68 +88,77 @@ class MojiOkoshi:
             print(f"WAVファイルへの書き込みエラー: {e}")
             
         # 処理キューには 48kHz / 3ch のデータをそのまま渡す
-        self.partial_audio_buffer.append(indata.copy())
-        
-        total_frames = sum(data.shape[0] for data in self.partial_audio_buffer)
-        if total_frames >= self.buffer_target_size:
-            combined_data = np.concatenate(self.partial_audio_buffer, axis=0)
-            self.audio_queue.put(combined_data)
-            print(f"{BUFFER_SEC}秒分のブロックをキューに追加 - 現在のキューサイズ: {self.audio_queue.qsize()}")
-            self.partial_audio_buffer = []
+        with self.buffer_lock:
+            self.partial_audio_buffer.append(indata.copy())
+            total_frames = sum(data.shape[0] for data in self.partial_audio_buffer)
+            if total_frames >= self.buffer_target_size:
+                self._flush_buffer_locked()
+                print(f"{BUFFER_SEC}秒分のブロックをキューに追加 - 現在のキューサイズ: {self.audio_queue.qsize()}")
+
+    def _flush_buffer_locked(self):
+        """
+        バッファの音声を、録音した時点のシーン名を付けてキューに送る。
+        buffer_lock を持った状態で呼ぶこと。
+        """
+        if not self.partial_audio_buffer:
+            return
+        combined_data = np.concatenate(self.partial_audio_buffer, axis=0)
+        self.audio_queue.put((self.current_scene, combined_data))
+        self.partial_audio_buffer = []
 
     def transcribe_worker(self):
+        """キューの音声を順番に文字起こしする。終了の合図 (None) は stop() が最後に入れる。"""
         processed_index = 0
-        while not self.stop_flag.is_set() or not self.audio_queue.empty() or self.partial_audio_buffer:
+        while True:
+            item = self.audio_queue.get()
+            if item is None:
+                print("文字起こしスレッドを終了しました。")
+                break
+
+            scene_name, data = item # data は 48kHz / 3ch
+            processed_index += 1
+            total_queue = processed_index + self.audio_queue.qsize()
+            self.update_progress('transcribing', processed_index - 1, total_queue)
+            print(f"処理開始 ({processed_index} / {total_queue}) [シーン: {scene_name}]")
             try:
-                timeout = 0.5 if self.stop_flag.is_set() else 1.0
-                data = self.audio_queue.get(timeout=timeout) # 48kHz / 3ch
-                # 終了シグナル (None) を受け取ったらワーカー終了
-                if data is None:
-                    self.audio_queue.task_done()
-                    print("[DEBUG] transcribe_worker: received None → exiting")
-                    break
-                try:
-                    processed_index += 1
-                    total_queue = processed_index + self.audio_queue.qsize()
-                    print(f"処理開始 ({processed_index} / {total_queue})")
+                # モノラル化 (np.meanが3chすべてを平均化してくれる)
+                if data.ndim > 1:
+                    mono = np.mean(data, axis=1)
+                else:
+                    mono = data.flatten()
 
-                    # モノラル化 (np.meanが3chすべてを平均化してくれる)
-                    if data.ndim > 1:
-                        mono = np.mean(data, axis=1)
-                    else:
-                        mono = data.flatten()
-
-                    if mono.size == 0:
-                        text = "[音声なし]"
-                        self.text_results.append(text)
-                        self.add_transcription(text) # [音声なし] もログには残す
-                        print(f"処理完了 ({processed_index} / {total_queue})")
-                        continue
-
+                if mono.size == 0:
+                    text = "[音声なし]"
+                else:
                     # リサンプリング (48kHz -> 16kHz)
                     resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
                     resampled = np.clip(resampled * VOLUME, -1.0, 1.0)
 
                     # Whisperで文字起こし
-                    try:
-                        result = self.model.transcribe(resampled, language=LANGUAGE)
-                        text = result["text"]
-                        print(text)
-                        self.text_results.append(text)
-                        self.add_transcription(text) # 成功したテキストをログに書く
-                    except Exception as e:
-                        text = f"[文字起こしエラー: {str(e)[:50]}...]"
-                        self.text_results.append(text)
-                        self.add_transcription(text) # エラー内容をログに書く
-                    print(f"処理完了 ({processed_index} / {total_queue})")
-                finally:
-                    self.audio_queue.task_done()
-            except queue.Empty:
-                if self.stop_flag.is_set() and self.audio_queue.empty() and len(self.partial_audio_buffer) == 0:
-                    break
-                continue
+                    result = self.model.transcribe(resampled, language=LANGUAGE)
+                    text = result["text"]
+                    print(text)
+            except Exception as e:
+                text = f"[文字起こしエラー: {str(e)[:50]}...]"
+                print(text)
+
+            self.text_results.append(text)
+            self.add_transcription(text, scene_name)
+            self.update_progress('transcribing', processed_index, processed_index + self.audio_queue.qsize())
+            print(f"処理完了 ({processed_index} / {total_queue})")
 
     def start(self):
+        if self.is_running:
+            print("⚠️ すでに録音中です。")
+            return
+
+        # 前回の録音の状態をリセット
+        self.stop_flag.clear()
+        self.audio_queue = queue.Queue()
+        with self.buffer_lock:
+            self.partial_audio_buffer = []
+        self.update_progress('idle', 0, 0)
+
         try:
             sd.default.device = SD_DEVICE
             sd.default.samplerate = SAMPLE_RATE # 48000
@@ -183,14 +197,26 @@ class MojiOkoshi:
 
             blocksize = int(RECORD_SEC * SAMPLE_RATE) # 48000Hz基準
 
-            self.stream = sd.InputStream(callback=self.audio_callback, blocksize=blocksize)
-            self.stream.start()
-            print(f"{RECORD_SEC}秒間隔で録音開始...")
-
+            # ストリームより先にワーカーを起動しておく
             self.thread = threading.Thread(target=self.transcribe_worker, daemon=True)
             self.thread.start()
+
+            self.stream = sd.InputStream(callback=self.audio_callback, blocksize=blocksize)
+            self.stream.start()
+            self.is_running = True
+            print(f"{RECORD_SEC}秒間隔で録音開始...")
         except Exception as e:
             print(f"録音開始エラー: {e}")
+            if self.stream is not None:
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+            if self.thread is not None and self.thread.is_alive():
+                self.audio_queue.put(None)
+                self.thread.join()
+            self.thread = None
             if self.wav_writer:
                 self.wav_writer.close()
                 self.wav_writer = None
@@ -198,13 +224,27 @@ class MojiOkoshi:
             raise
 
     def stop(self):
+        """
+        録音を止め、残りの音声をすべて文字起こししてから戻る。
+        順番: ストリーム停止 → 残りの音声をキューへ → 終了の合図 (None) → ワーカー終了待ち
+        """
+        if not self.is_running:
+            print("⚠️ 録音していないので停止処理はスキップします。")
+            return
+        self.is_running = False
         print("\n録音停止中...")
 
-        if hasattr(self, 'stream') and self.stream.active:
-            self.stream.stop()
-            self.stream.close()
-            print("録音ストリームを停止しました。")
-            
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+                print("録音ストリームを停止しました。")
+            except Exception as e:
+                print(f"録音ストリームの停止中にエラーが発生しました: {e}")
+            self.stream = None
+        # ストリーム停止後に届いたコールバックは無視する
+        self.stop_flag.set()
+
         if self.wav_writer:
             try:
                 self.wav_writer.close()
@@ -214,22 +254,19 @@ class MojiOkoshi:
             self.wav_writer = None
             self.current_wav_path = None
 
-        if self.partial_audio_buffer:
-            print(f"残りの音声データ ({sum(data.shape[0] for data in self.partial_audio_buffer)}フレーム) をキューに追加します。")
-            combined_data = np.concatenate(self.partial_audio_buffer, axis=0)
-            self.audio_queue.put(combined_data)
-            self.partial_audio_buffer = []
+        with self.buffer_lock:
+            if self.partial_audio_buffer:
+                print(f"残りの音声データ ({sum(data.shape[0] for data in self.partial_audio_buffer)}フレーム) をキューに追加します。")
+                self._flush_buffer_locked()
 
-        print("残りの文字起こし処理を待っています...")
-        self.audio_queue.join()
+        # 終了の合図は必ず残りの音声より後ろに入れる
+        self.audio_queue.put(None)
 
-        self.stop_flag.set()
-
-        if self.thread is not None and self.thread.is_alive():
-            print("文字起こしスレッドの終了を待機中...")
+        if self.thread is not None:
+            print("残りの文字起こし処理を待っています...")
             self.thread.join()
-            print("スレッドが正常に終了しました。")
-            
+            self.thread = None
+
         if self.current_text_log_path:
             try:
                 with open(self.current_text_log_path, "a", encoding="utf-8") as f:
@@ -257,50 +294,29 @@ class MojiOkoshi:
             print(f"⚠️ シーン名 '{scene_title}' は既に存在します。別の名前を入力してください。")
             return False
 
-        prev_scene = self.current_scene
-        old_buffer = self.partial_audio_buffer
-        old_queue_items = []
-        while not self.audio_queue.empty():
-            try:
-                old_queue_items.append(self.audio_queue.get_nowait())
-            except queue.Empty:
-                break
-        old_queue = self.audio_queue
+        # 切り替え前の音声は前のシーン名を付けてキューに送り、同じワーカーが順番に処理する
+        with self.buffer_lock:
+            prev_scene = self.current_scene
+            self._flush_buffer_locked()
+            self.current_scene = scene_title
+        with self.transcription_lock:
+            self.scene_transcriptions.setdefault(scene_title, [])
 
-        self.partial_audio_buffer = []
-        #self.audio_queue = queue.Queue()
-        
-        self.current_scene = scene_title
-        self.scene_transcriptions[scene_title] = []
-
-        if old_buffer or not old_queue.empty():
-            queue_items = []
-            while not old_queue.empty():
-                try:
-                    queue_items.append(old_queue.get_nowait())
-                except queue.Empty:
-                    break
-            
-            threading.Thread(
-                target=self.process_scene_async,
-                args=(prev_scene, old_buffer, queue_items),
-                daemon=True
-            ).start()
-            print(f"シーン '{prev_scene}' の未処理データをバックグラウンドで処理開始。")
-
-        print(f"\n🎬 シーン切り替え → {scene_title}")
+        print(f"\n🎬 シーン切り替え: {prev_scene} → {scene_title}")
         return True
 
-    def add_transcription(self, text: str):
-        """文字起こし結果を現在のシーンに追加 (および即時ログに追記)"""
-        
+    def add_transcription(self, text: str, scene_name: str = None):
+        """文字起こし結果をシーンに追加 (および即時ログに追記)。scene_name 省略時は現在のシーン。"""
+        if scene_name is None:
+            scene_name = self.current_scene
+
         # 1. GUI用のシーンリストに追加
         with self.transcription_lock:
-            if self.current_scene not in self.scene_transcriptions:
-                self.scene_transcriptions[self.current_scene] = []
-            self.scene_transcriptions[self.current_scene].append(text)
-        
-        print(f"シーン '{self.current_scene}' にテキストを追加: '{text[:50]}...'")
+            if scene_name not in self.scene_transcriptions:
+                self.scene_transcriptions[scene_name] = []
+            self.scene_transcriptions[scene_name].append(text)
+
+        print(f"シーン '{scene_name}' にテキストを追加: '{text[:50]}...'")
         
         # 2. 即時テキストログへの追記
         if self.current_text_log_path:
@@ -442,96 +458,3 @@ class MojiOkoshi:
 
         print(f"全シーン結合テキスト保存完了: {combined_file_path}")
         return combined_file_path
-    
-    def process_partial_buffer_for_scene(self):
-        """現在のシーンに対して、未処理バッファとキューのデータを文字起こしして追加"""
-        if self.partial_audio_buffer:
-            combined_data = np.concatenate(self.partial_audio_buffer, axis=0)
-            mono = np.mean(combined_data, axis=1) if combined_data.ndim > 1 else combined_data.flatten()
-            if mono.size > 0:
-                resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
-                resampled = np.clip(resampled * 1.3, -1.0, 1.0)
-                try:
-                    result = self.model.transcribe(resampled, language=LANGUAGE)
-                    text = result["text"]
-                    self.add_transcription(text) # このテキストも即時ログに追記される
-                except Exception as e:
-                    text = f"[文字起こしエラー: {str(e)[:50]}...]"
-                    self.add_transcription(text) # エラーも追記
-            self.partial_audio_buffer = []
-
-        while not self.audio_queue.empty():
-            try:
-                data = self.audio_queue.get_nowait()
-                mono = np.mean(data, axis=1) if data.ndim > 1 else data.flatten()
-                if mono.size > 0:
-                    resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
-                    resampled = np.clip(resampled * 1.3, -1.0, 1.0)
-                    try:
-                        result = self.model.transcribe(resampled, language=LANGUAGE)
-                        text = result["text"]
-                        self.add_transcription(text) # このテキストも即時ログに追記される
-                    except Exception as e:
-                        text = f"[文字起こしエラー: {str(e)[:50]}...]"
-                        self.add_transcription(text) # エラーも追記
-                self.audio_queue.task_done()
-            except queue.Empty:
-                break
-    
-    def process_scene_async(self, scene_name, buffer_data, queue_data):
-        """
-        バックグラウンドで(古い)シーンのバッファとキューを文字起こしして追加
-        (メモ: これは古いシーンの残りデータ用なので、即時ログには追記しない)
-        """
-        texts_to_add = []
-        
-        if buffer_data:
-            try:
-                combined_data = np.concatenate(buffer_data, axis=0)
-                mono = np.mean(combined_data, axis=1) if combined_data.ndim > 1 else combined_data.flatten()
-                if mono.size == 0:
-                    pass
-                elif mono.size < TARGET_SR * 0.02:  # ★ 追加
-                    pass
-                else:
-                    resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
-                    resampled = np.clip(resampled * 1.3, -1.0, 1.0)
-                    if len(resampled) < 320:
-                        pass
-                    else:
-                        result = self.model.transcribe(resampled, language=LANGUAGE)
-                        texts_to_add.append(result["text"])
-            except Exception as e:
-                texts_to_add.append(f"[文字起こしエラー: {str(e)[:50]}...]")
-                print(f"[バックグラウンドバッファ処理エラー: {e}]")
-
-        for data in queue_data:
-            try:
-                mono = np.mean(data, axis=1) if data.ndim > 1 else data.flatten()
-                
-                if mono.size == 0:
-                    continue
-                
-                if mono.size < TARGET_SR * 0.02:
-                    continue
-
-                resampled = librosa.resample(mono, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
-                resampled = np.clip(resampled * 1.3, -1.0, 1.0)
-
-                if len(resampled) < 320:
-                    continue
-
-                result = self.model.transcribe(resampled, language=LANGUAGE)
-                texts_to_add.append(result["text"])
-
-            except Exception as e:
-                texts_to_add.append(f"[文字起こしエラー: {str(e)[:50]}...]")
-                print(f"[バックグラウンドキュー処理エラー: {e}]")
-
-        if texts_to_add:
-            with self.transcription_lock:
-                if scene_name not in self.scene_transcriptions:
-                    self.scene_transcriptions[scene_name] = []
-                self.scene_transcriptions[scene_name].extend(texts_to_add)
-                
-        print(f"シーン '{scene_name}' のバックグラウンド処理が完了しました。")
