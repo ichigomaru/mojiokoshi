@@ -58,7 +58,10 @@ def filter_stderr():
 
 
 def main():
-    filter_stderr()
+    try:
+        filter_stderr()
+    except OSError:
+        pass  # PyInstaller のウィンドウアプリなど stderr が無いときはそのまま
     from src.gui import MojiOkoshiGUI
     app = MojiOkoshiGUI()
     app.run()

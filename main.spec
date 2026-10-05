@@ -1,11 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
 
 
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=['src'],  # gui.py は mojiokoshi を src から import する
     binaries=[],
-    datas=[],
+    datas=collect_data_files('customtkinter'),  # CustomTkinter のテーマ(json)・フォント
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

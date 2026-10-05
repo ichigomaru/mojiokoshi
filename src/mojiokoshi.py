@@ -4,8 +4,6 @@ import librosa
 import threading
 import queue
 import os
-import tkinter as tk
-from tkinter import messagebox
 import datetime  
 import soundfile as sf 
 
@@ -407,68 +405,6 @@ class MojiOkoshi:
     @property
     def transcription(self):
         return "\n".join(self.text_results)
-    
-    def get_initial_scene_name(self, parent_window=None):
-        """最初のシーン名を入力するダイアログを表示"""
-        dialog = tk.Toplevel(parent_window) if parent_window else tk.Tk()
-        dialog.title("シーン名を入力")
-        dialog.geometry("400x150")
-        dialog.resizable(False, False)
-        
-        # 親ウィンドウ(-topmost)の裏に回らないよう、開いている間は親の -topmost を外し、
-        # ダイアログだけを -topmost にする。macOS では transient を付けると -topmost が効かないので付けない
-        parent_was_topmost = False
-        if parent_window:
-            parent_was_topmost = bool(parent_window.attributes("-topmost"))
-            parent_window.attributes("-topmost", False)
-            dialog.grab_set()
-            dialog.geometry("+%d+%d" % (parent_window.winfo_rootx() + 50, parent_window.winfo_rooty() + 50))
-        dialog.attributes("-topmost", True)
-        dialog.lift()
-        dialog.focus_force()
-        
-        label = tk.Label(dialog, text="最初のシーン名を入力してください:", font=("Arial", 12))
-        label.pack(pady=20)
-        
-        entry = tk.Entry(dialog, width=30, font=("Arial", 11))
-        entry.pack(pady=10)
-        entry.focus()
-        
-        button_frame = tk.Frame(dialog)
-        button_frame.pack(pady=10)
-        
-        result = {"scene_name": None}
-        
-        def on_ok():
-            scene_name = entry.get().strip()
-            if scene_name:
-                result["scene_name"] = scene_name
-                self.switch_scene(scene_name)
-                dialog.destroy()
-            else:
-                messagebox.showwarning("警告", "シーン名を入力してください。", parent=dialog)
-        
-        def on_cancel():
-            result["scene_name"] = "default"
-            self.switch_scene("default")
-            dialog.destroy()
-        
-        ok_button = tk.Button(button_frame, text="OK", command=on_ok, width=10)
-        ok_button.pack(side=tk.LEFT, padx=5)
-        
-        cancel_button = tk.Button(button_frame, text="デフォルト", command=on_cancel, width=10)
-        cancel_button.pack(side=tk.LEFT, padx=5)
-        
-        entry.bind('<Return>', lambda e: on_ok())
-        dialog.bind('<Escape>', lambda e: on_cancel())
-        
-        if parent_window:
-            dialog.wait_window()
-            parent_window.attributes("-topmost", parent_was_topmost)
-        else:
-            dialog.mainloop()
-        
-        return result["scene_name"]
     
     def save_combined_scenario(self, scenario_title, output_dir=None):
         """
