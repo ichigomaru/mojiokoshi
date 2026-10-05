@@ -19,6 +19,27 @@ MODEL_SIZE = "large"      # whisperモデルサイズ
 SD_DEVICE = "mojiokoshi"  # spot検索、オーディオデバイスの設定から変更可能
 LANGUAGE = "ja"           # Whisperの言語設定（例: "ja"、"en"）
 
+# 無音のときに Whisper が書き出しがちな幻の文。区間のテキストがこれだけなら消す (必要に応じて追加)
+HALLUCINATION_PHRASES = ("ご視聴ありがとうございました",)
+_PUNCTUATION = " 　。、．，.,!！?？…・「」"
+
+
+def clean_transcription(result):
+    """
+    Whisper の結果から、無音の幻の文を除いたテキストを返す。
+    区間 (segment) ごとに見て、テキストが HALLUCINATION_PHRASES だけの区間を捨てる。
+    """
+    segments = result.get("segments")
+    if segments is None:
+        segments = [{"text": result.get("text", "")}]
+    kept = []
+    for seg in segments:
+        text = seg.get("text", "")
+        if text.strip(_PUNCTUATION) in HALLUCINATION_PHRASES:
+            continue
+        kept.append(text)
+    return "".join(kept).strip()
+
 class MojiOkoshi:
     def __init__(self):
         # Whisper の読み込みは時間がかかるので裏で行い、その間も録音できるようにする
@@ -161,14 +182,15 @@ class MojiOkoshi:
 
                     # Whisperで文字起こし
                     result = self.model.transcribe(resampled, language=LANGUAGE)
-                    text = result["text"]
+                    text = clean_transcription(result)
                     print(text)
             except Exception as e:
                 text = f"[文字起こしエラー: {str(e)[:50]}...]"
                 print(text)
 
-            self.text_results.append(text)
-            self.add_transcription(text, scene_name)
+            if text:  # 無音などで何も残らなかったら追加しない
+                self.text_results.append(text)
+                self.add_transcription(text, scene_name)
             self.update_progress('transcribing', processed_index, processed_index + self.audio_queue.qsize())
             print(f"処理完了 ({processed_index} / {total_queue})")
 

@@ -248,5 +248,64 @@ class BackgroundModelLoadTest(unittest.TestCase):
         self.assertTrue(self.m.last_stop_skipped)
 
 
+
+def seg(text, no_speech=0.1):
+    return {"text": text, "no_speech_prob": no_speech}
+
+
+class CleanTranscriptionTest(unittest.TestCase):
+    """無音の幻の文 (ご視聴ありがとうございました 等) を消す処理"""
+
+    def clean(self, *segments):
+        return mojiokoshi.clean_transcription({"text": "".join(s["text"] for s in segments),
+                                               "segments": list(segments)})
+
+    def test_drop_phrase_segment(self):
+        self.assertEqual(self.clean(seg("こんにちは。"), seg("ご視聴ありがとうございました")), "こんにちは。")
+        self.assertEqual(self.clean(seg(" ご視聴ありがとうございました。")), "")
+
+    def test_keep_other_segments_regardless_of_no_speech_prob(self):
+        # 無音判定 (no_speech_prob) では消さない。定型文以外はそのまま残す
+        self.assertEqual(self.clean(seg("では始めます"), seg("小声の一言", no_speech=0.9)), "では始めます小声の一言")
+
+    def test_keep_phrase_inside_real_speech(self):
+        # 定型文が他の発言と同じ区間に混ざっている場合は消さない
+        text = "皆さんご視聴ありがとうございましたと言って終わります"
+        self.assertEqual(self.clean(seg(text)), text)
+
+    def test_without_segments(self):
+        self.assertEqual(mojiokoshi.clean_transcription({"text": "ご視聴ありがとうございました"}), "")
+        self.assertEqual(mojiokoshi.clean_transcription({"text": "普通の発言"}), "普通の発言")
+
+
+class HallucinationWorkerTest(unittest.TestCase):
+    """ワーカー経由で、幻の文だけの音声はシーンに何も追加されない"""
+
+    def setUp(self):
+        self._cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+        self.m = mojiokoshi.MojiOkoshi()
+        self.assertTrue(self.m.model_ready.wait(5))
+        outputs = iter([
+            {"text": "ご視聴ありがとうございました", "segments": [seg("ご視聴ありがとうございました", 0.2)]},
+            {"text": "本題です", "segments": [seg("本題です")]},
+        ])
+        self.m.model = types.SimpleNamespace(transcribe=lambda audio, language=None: next(outputs))
+        self.m.buffer_target_size = SR
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+        self._tmp.cleanup()
+
+    def test_worker_skips_empty_text(self):
+        self.m.start()
+        self.m.audio_callback(block(), SR, None, None)
+        self.m.audio_callback(block(), SR, None, None)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertEqual(self.m.scene_transcriptions["default"], ["本題です"])
+        self.assertEqual(self.m.text_results, ["本題です"])
+
+
 if __name__ == "__main__":
     unittest.main()
