@@ -8,6 +8,7 @@ import tkinter as tk
 import customtkinter as ctk
 
 from mojiokoshi import MojiOkoshi, LANGUAGE
+from scene_clock import SceneClock
 import fusetter
 
 # --- 見た目の設定 (ハードウェア風。配色が前提なのでライト固定) ---
@@ -72,9 +73,10 @@ class MojiOkoshiGUI:
         self.root.minsize(460, 330)
 
         self.mojiokoshi = MojiOkoshi()
-        # "idle"(待機) / "recording"(録音中) / "stopping"(停止処理中)
+        # "idle"(待機) / "recording"(録音中) / "paused"(一時停止中) / "stopping"(停止処理中) / "posting"(投稿中)
         self.state = "idle"
-        self.record_started_at = None
+        self.scene_clock = SceneClock()
+        self.total_offset = 0.0  # 全体タイマーは録音ごとに0から (それまでのシーンの時間を引く)
         self._blink = False
         self._model_error_shown = False
         self._warning_shown = False
@@ -330,7 +332,7 @@ class MojiOkoshiGUI:
             self.scene_warning_label.configure(text="")
             self._warning_shown = False
         # If empty or stopping, disable button
-        if not scene_title or self.state in ("stopping", "posting"):
+        if not scene_title or self.state in ("paused", "stopping", "posting"):
             self.switch_scene_button.configure(state="disabled")
             return
         if scene_title in self.mojiokoshi.scene_transcriptions:
@@ -344,10 +346,12 @@ class MojiOkoshiGUI:
         """シーン履歴に新しいシーンを追加し、表示パネルを更新"""
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.scene_history.append(f"[{timestamp}] {scene_name}")
+        self.scene_clock.add(scene_name, time.time(), self.state == "recording")
 
-        for no_label, name_label in self.history_rows:
+        for no_label, name_label, time_label in self.history_rows:
             no_label.configure(text_color=MUTED)
             name_label.configure(text_color=MUTED)
+            time_label.configure(text_color=MUTED)
 
         row = len(self.history_rows)
         row_frame = ctk.CTkFrame(self.history_frame, fg_color="transparent")
@@ -359,15 +363,28 @@ class MojiOkoshiGUI:
         name_label = ctk.CTkLabel(row_frame, text=scene_name, font=self.font_body, text_color=INK,
                                   anchor="w", height=22)
         name_label.grid(row=0, column=1, sticky="w")
-        self.history_rows.append((no_label, name_label))
+        # そのシーンの録音時間 (今のシーンは update_scene_timers で毎回更新)
+        time_label = ctk.CTkLabel(row_frame, text="00:00", font=self.font_mono, text_color=ORANGE, height=22)
+        time_label.grid(row=0, column=2, padx=(8, 10))
+        self.history_rows.append((no_label, name_label, time_label))
 
         # 最新の行が見えるようにスクロール
         self.root.after(50, lambda: self.history_frame._parent_canvas.yview_moveto(1.0))
-        self.scene_no_label.configure(text=f"SCENE {len(self.history_rows):02d}")
         self.current_scene_label.configure(text=scene_name)
+        self.update_scene_timers()
+
+    def update_scene_timers(self):
+        """表示パネルのシーン番号の横と、履歴の各行に、シーンの録音時間を出す"""
+        if not self.history_rows:
+            return
+        now = time.time()
+        for i, (_, _, time_label) in enumerate(self.history_rows):
+            time_label.configure(text=_format_elapsed(self.scene_clock.elapsed(i, now)))
+        current = _format_elapsed(self.scene_clock.elapsed(len(self.history_rows) - 1, now))
+        self.scene_no_label.configure(text=f"SCENE {len(self.history_rows):02d} · {current}")
 
     def switch_scene(self):
-        if self.state in ("stopping", "posting"):
+        if self.state in ("paused", "stopping", "posting"):
             self._show_warning("停止処理中は切り替えられません")
             return
         scene_title = self.scene_title_entry.get().strip()
@@ -406,15 +423,98 @@ class MojiOkoshiGUI:
         except Exception as e:
             self.show_message("エラー", f"録音を開始できませんでした: {e}")
             return
+        if not self.history_rows:  # 最初のシーン名を入れずに始めたときも、時間を数えられるようにする
+            self.add_scene_to_history(self.mojiokoshi.current_scene)
         self.state = "recording"
-        self.record_started_at = time.time()
+        now = time.time()
+        self.total_offset = self.scene_clock.total(now)
+        self.scene_clock.start(now)
         self.record_button.configure(text="■  STOP", fg_color=INK, hover_color=INK_HOVER)
         self._set_status("")
         self.update_record_status()
 
     def stop_recording(self):
+        """STOP: 録音だけ止めて (文字起こしは裏で続く)、タイトル・投稿の有無を聞く。再開もできる"""
         if self.state != "recording":
             return
+        try:
+            self.mojiokoshi.pause()
+        except Exception as e:
+            self.show_message("エラー", f"録音を止められませんでした: {e}")
+            return
+        self.scene_clock.pause(time.time())
+        self.state = "paused"
+        self.record_button.configure(state="disabled", text="❚❚", fg_color=TRACK)
+        self.update_switch_scene_button_state()
+        self._set_status("一時停止中 (文字起こしは続いています)", MUTED)
+        self.update_record_status()
+
+        while True:
+            action, title, post = self.ask_finish()
+            if action == "finish":
+                self.finish_recording(title, post)
+                return
+            # 再開 (× や Esc で閉じたときも再開する)
+            try:
+                self.mojiokoshi.resume()
+            except Exception as e:
+                self.show_message("エラー", f"録音を再開できませんでした: {e}")
+                continue
+            self.state = "recording"
+            self.scene_clock.start(time.time())
+            self.record_button.configure(state="normal", text="■  STOP", fg_color=INK, hover_color=INK_HOVER)
+            self._set_status("")
+            self.update_switch_scene_button_state()
+            self.update_record_status()
+            return
+
+    def ask_finish(self):
+        """
+        一時停止中の画面。タイトル入力・ふせったー投稿のチェック・[再開] [保存して終了]。
+        ("finish", タイトル, 投稿するか) / ("resume", None, False) を返す。× や Esc は再開。
+        """
+        dialog = ctk.CTkToplevel(self.root, fg_color=BODY)
+        dialog.title("一時停止中")
+        dialog.resizable(False, False)
+        dialog.grid_columnconfigure((0, 1), weight=1, uniform="btn")
+        result = {"action": "resume", "title": None, "post": False}
+
+        ctk.CTkLabel(dialog, text="録音を一時停止しました", font=self.font_scene, text_color=INK).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(16, 2))
+        ctk.CTkLabel(dialog, text="文字起こしは裏で続いています。終了するならタイトルを入力してください。",
+                     font=self.font_tag, text_color=MUTED).grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 8))
+        entry = ctk.CTkEntry(dialog, placeholder_text="例: 2026-10-05 打ち合わせ", width=320, height=38,
+                             corner_radius=6, font=self.font_body, fg_color=KEY, border_color=KEY_BORDER,
+                             border_width=1, text_color=INK, placeholder_text_color="#A09C93")
+        entry.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18)
+        post_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(dialog, text="ふせったーに投稿する", variable=post_var, font=self.font_body,
+                        text_color=INK, fg_color=ORANGE, hover_color=ORANGE_HOVER, border_color=KEY_BORDER,
+                        corner_radius=4).grid(row=3, column=0, columnspan=2, sticky="w", padx=18, pady=(10, 0))
+        warning = ctk.CTkLabel(dialog, text="", font=self.font_tag, text_color=ORANGE, height=16)
+        warning.grid(row=4, column=0, columnspan=2, sticky="w", padx=18)
+
+        def on_finish():
+            title = entry.get().strip()
+            if not title:
+                warning.configure(text="タイトルを入力してください")
+                return
+            result.update(action="finish", title=title, post=post_var.get())
+            dialog.destroy()
+
+        self._key_button(dialog, "▶  再開", dialog.destroy).grid(
+            row=5, column=0, sticky="ew", padx=(18, 5), pady=(2, 16))
+        self._key_button(dialog, "保存して終了", on_finish, primary=True).grid(
+            row=5, column=1, sticky="ew", padx=(5, 18), pady=(2, 16))
+        entry.bind("<Return>", lambda e: on_finish())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+        self._run_modal(dialog, entry)
+        return result["action"], result["title"], result["post"]
+
+    def finish_recording(self, title, post):
+        """残りの文字起こしが終わるのを待ってから、保存 (と投稿) して終了する"""
         self.state = "stopping"
         self.record_button.configure(state="disabled", text="…", fg_color=TRACK)
         self.update_switch_scene_button_state()
@@ -460,65 +560,51 @@ class MojiOkoshiGUI:
                 self.show_message(
                     "文字起こしなし",
                     f"{reason}、文字起こしはしませんでした。\n"
-                    + (f"録音は {self.mojiokoshi.last_wav_path} に保存されています。"
-                       if self.mojiokoshi.last_wav_path else "録音(WAV)も保存できませんでした。")
+                    + ("録音は " + "、".join(self.mojiokoshi.wav_paths) + " に保存されています。"
+                       if self.mojiokoshi.wav_paths else "録音(WAV)も保存できませんでした。")
                 )
                 self.reset_ui()
                 return
             self._set_status("✓ 文字起こし完了", GREEN)
-            # 完了メッセージを表示
-            self.show_completion_message()
+            self.save_scenario(title, post)
 
         self.root.after(200, check_done)
 
-    def show_completion_message(self):
-        """完了メッセージを表示してシナリオまとめファイル作成"""
+    def save_scenario(self, final_title, post):
+        """全シーンをまとめてタイトルのファイルに保存し、投稿するならふせったーへ、しないなら終了する"""
         try:
-            # Prompt user for final scenario title
-            action, final_title = self.ask_text(
-                "シナリオタイトル", "シナリオのタイトルを入力してください",
-                placeholder="例: 2026-10-05 打ち合わせ", ok_text="保存", secondary_text="キャンセル")
-            if action == "ok" and final_title:
-                # Collect all scenes and their text
-                combined_text = ""
-                scenes = getattr(self.mojiokoshi, "scenes", {})
-                if not isinstance(scenes, dict):
-                    scenes = {}
-                for scene_name, text in scenes.items():
-                    combined_text += f"【{scene_name}】\n{text}\n\n"
+            combined_text = ""
+            scenes = getattr(self.mojiokoshi, "scenes", {})
+            if not isinstance(scenes, dict):
+                scenes = {}
+            for scene_name, text in scenes.items():
+                combined_text += f"【{scene_name}】\n{text}\n\n"
 
-                # LANGUAGE定数に基づいて、適切な改行処理を適用します
-                if LANGUAGE == "ja":
-                    print("DEBUG: 日本語の改行フォーマットを適用します。")
-                    formatted_text = _insert_newlines_ja(combined_text)
-                elif LANGUAGE == "en":
-                    print("DEBUG: 英語の改行フォーマットを適用します。")
-                    formatted_text = _insert_newlines_en(combined_text)
-                else:
-                    # 'ja' 'en' 以外の場合は、デフォルトの結合テキストを使用
-                    print(f"DEBUG: '{LANGUAGE}' に対応する改行フォーマットがありません。")
-                    formatted_text = combined_text
-
-                # Save to file named by final scenario title
-                os.makedirs("log/scenario_log", exist_ok=True)
-                filename = os.path.join("log", "scenario_log", f"{final_title}.txt")
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write(formatted_text)
-                print(f"シナリオファイルを {filename} に保存しました。")
-
-                if self.show_message("ふせったー", "ふせったーに投稿しますか？",
-                                     buttons=(("いいえ", "no"), ("はい", "yes"))) == "yes":
-                    self.start_fusetter_post(final_title, formatted_text)
-                    return
-                # 投稿しないなら、保存したらそのまま終了する
-                self.quit_app()
+            # LANGUAGE定数に基づいて、適切な改行処理を適用します
+            if LANGUAGE == "ja":
+                formatted_text = _insert_newlines_ja(combined_text)
+            elif LANGUAGE == "en":
+                formatted_text = _insert_newlines_en(combined_text)
             else:
-                self.show_message("未入力", "シナリオタイトルが入力されませんでした。UIをリセットします。")
-                self.reset_ui()
+                # 'ja' 'en' 以外の場合は、デフォルトの結合テキストを使用
+                print(f"DEBUG: '{LANGUAGE}' に対応する改行フォーマットがありません。")
+                formatted_text = combined_text
+
+            os.makedirs("log/scenario_log", exist_ok=True)
+            filename = os.path.join("log", "scenario_log", f"{final_title}.txt")
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(formatted_text)
+            print(f"シナリオファイルを {filename} に保存しました。")
         except Exception as e:
-            print(f"DEBUG: show_completion_messageでエラー: {e}")
-            self.show_message("エラー", f"保存・投稿の準備中にエラーが発生しました: {e}")
+            print(f"DEBUG: save_scenarioでエラー: {e}")
+            self.show_message("エラー", f"保存中にエラーが発生しました: {e}")
             self.reset_ui()
+            return
+
+        if post:
+            self.start_fusetter_post(final_title, formatted_text)
+        else:
+            self.quit_app()
 
     def quit_app(self):
         print("アプリを終了します。")
@@ -617,7 +703,6 @@ class MojiOkoshiGUI:
             return
 
         self.state = "idle"
-        self.record_started_at = None
         self.update_record_status()
         self.update_switch_scene_button_state()
 
@@ -628,8 +713,11 @@ class MojiOkoshiGUI:
         if self.state == "recording":
             self._blink = not self._blink
             self.record_status_label.configure(text="● REC" if self._blink else "  REC", text_color=ORANGE)
-            self.timer_label.configure(text=_format_elapsed(time.time() - self.record_started_at),
+            self.timer_label.configure(text=_format_elapsed(self.scene_clock.total(time.time()) - self.total_offset),
                                        text_color=ORANGE)
+        elif self.state == "paused":
+            self.record_status_label.configure(text="❚❚ PAUSED", text_color=DISPLAY_TEXT)
+            self.timer_label.configure(text_color=DISPLAY_MUTED)
         elif self.state == "stopping":
             self.record_status_label.configure(text="PROCESSING", text_color=DISPLAY_TEXT)
         elif self.state == "posting":
@@ -650,6 +738,7 @@ class MojiOkoshiGUI:
             self.progress_bar.configure(progress_color=INK if processed else TRACK)
             if self.state == "recording":
                 self.update_record_status()
+                self.update_scene_timers()
             self.update_model_status()
         except Exception as e:
             print(f"DEBUG: update_progressでエラー: {e}")

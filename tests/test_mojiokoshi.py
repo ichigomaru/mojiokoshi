@@ -171,6 +171,105 @@ class MojiOkoshiTest(unittest.TestCase):
 
 
 
+class PauseResumeTest(unittest.TestCase):
+    """STOP で一時停止 → 再開 / 一時停止のまま終了"""
+
+    def setUp(self):
+        self._cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+        self.m = mojiokoshi.MojiOkoshi()
+        self.assertTrue(self.m.model_ready.wait(5))
+        self.m.buffer_target_size = 3 * SR
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+        self._tmp.cleanup()
+
+    def feed(self, n):
+        for _ in range(n):
+            self.m.audio_callback(block(), SR, None, None)
+
+    def test_pause_resume_then_stop(self):
+        self.m.start()
+        self.feed(4)  # 3秒はキューへ、1秒はバッファ
+        self.m.pause()
+        self.assertTrue(self.m.is_paused)
+        self.assertFalse(self.m.is_running)
+        self.feed(2)  # 一時停止中に届いた音声は無視される
+        self.m.resume()
+        self.assertFalse(self.m.is_paused)
+        self.assertTrue(self.m.is_running)
+        self.feed(2)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertEqual(self.m.scene_transcriptions["default"], ["3s", "1s", "2s"])
+        # 再開したら WAV は別ファイル (同じ秒でも上書きしない)
+        self.assertEqual(len(self.m.wav_paths), 2)
+        self.assertEqual(len(set(self.m.wav_paths)), 2)
+        for p in self.m.wav_paths:
+            self.assertTrue(os.path.getsize(p) > 0)
+        self.assertEqual(self.m.last_wav_path, self.m.wav_paths[-1])
+        with open(glob_one("log/scenario_log/other/*.txt"), encoding="utf-8") as f:
+            log = f.read()
+        self.assertIn("--- 一時停止 ---", log)
+        self.assertIn("--- 再開 ---", log)
+        self.assertIn("--- 録音停止 ---", log)
+
+    def test_stop_while_paused(self):
+        self.m.start()
+        self.feed(2)
+        self.m.pause()
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertFalse(self.m.is_paused)
+        self.assertEqual(self.m.scene_transcriptions["default"], ["2s"])
+        self.assertIsNone(self.m.thread)
+        # 終わったあとは、また新しく録音を始められる
+        self.m.start()
+        self.feed(1)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertEqual(self.m.scene_transcriptions["default"], ["2s", "1s"])
+
+    def test_transcribe_while_paused(self):
+        """一時停止中も文字起こしは裏で進む"""
+        self.m.start()
+        self.feed(3)
+        self.m.pause()
+        deadline = time.time() + 5
+        while not self.m.scene_transcriptions.get("default") and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.m.scene_transcriptions["default"], ["3s"])
+        self.assertTrue(run_with_timeout(self.m.stop))
+
+    def test_resume_failure_stays_paused(self):
+        self.m.start()
+        self.feed(1)
+        self.m.pause()
+        orig = fake_sd.InputStream
+
+        def broken(*a, **k):
+            raise RuntimeError("マイクが無い(テスト)")
+
+        fake_sd.InputStream = broken
+        try:
+            with self.assertRaises(RuntimeError):
+                self.m.resume()
+        finally:
+            fake_sd.InputStream = orig
+        self.assertTrue(self.m.is_paused)
+        self.feed(1)  # 無視される
+        self.m.resume()
+        self.feed(1)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertEqual(self.m.scene_transcriptions["default"], ["1s", "1s"])
+
+
+def glob_one(pattern):
+    import glob
+    found = glob.glob(pattern)
+    assert len(found) == 1, found
+    return found[0]
+
+
 class BackgroundModelLoadTest(unittest.TestCase):
     """モデルを裏で読み込んでいる間の録音・停止"""
 
@@ -332,6 +431,37 @@ class CleanTranscriptionTest(unittest.TestCase):
     def test_without_segments(self):
         self.assertEqual(mojiokoshi.clean_transcription({"text": "ご視聴ありがとうございました"}), "")
         self.assertEqual(mojiokoshi.clean_transcription({"text": "普通の発言"}), "普通の発言")
+
+
+class CollapseRepeatsTest(unittest.TestCase):
+    def test_collapse(self):
+        c = mojiokoshi.collapse_repeats
+        self.assertEqual(c("ここ3年ですね結構結構結構結構結構結構 意外と"), "ここ3年ですね結構 意外と")
+        self.assertEqual(c("それらに入っているそれらに入っているそれらに入っているそれらに入っている"), "それらに入っている")
+        self.assertEqual(c("結構 結構 結構 結構です"), "結構です")
+        self.assertEqual(c("結構結構結構"), "結構結構結構")  # 3回まではそのまま
+        self.assertEqual(c("ははは、そうですね"), "ははは、そうですね")
+        self.assertEqual(c("10000円で1111番"), "10000円で1111番")  # 数字はまとめない
+
+    def test_clean_transcription_collapses(self):
+        result = {"segments": [seg("結構結構"), seg("結構結構結構です")]}
+        self.assertEqual(mojiokoshi.clean_transcription(result), "結構です")
+
+
+class MlxWhisperModelTest(unittest.TestCase):
+    def test_options(self):
+        calls = []
+        fake_mlx = types.ModuleType("mlx_whisper")
+        fake_mlx.transcribe = lambda audio, **kw: calls.append(kw) or {"text": ""}
+        sys.modules["mlx_whisper"] = fake_mlx
+        try:
+            model = mojiokoshi.MlxWhisperModel("repo/x")
+            model.transcribe(np.zeros(10, dtype=np.float32), language="ja")
+        finally:
+            del sys.modules["mlx_whisper"]
+        self.assertEqual(len(calls), 2)  # 読み込み時の空回し + 本番
+        self.assertEqual(calls[-1], {"path_or_hf_repo": "repo/x", "language": "ja",
+                                     "condition_on_previous_text": False})
 
 
 class HallucinationWorkerTest(unittest.TestCase):

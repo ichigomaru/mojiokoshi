@@ -4,6 +4,7 @@ import librosa
 import threading
 import queue
 import os
+import re
 import datetime  
 import soundfile as sf 
 
@@ -23,6 +24,15 @@ LANGUAGE = "ja"           # Whisperの言語設定（例: "ja"、"en"）
 # 無音のときに Whisper が書き出しがちな幻の文。区間のテキストがこれだけなら消す (必要に応じて追加)
 HALLUCINATION_PHRASES = ("ご視聴ありがとうございました",)
 _PUNCTUATION = " 　。、．，.,!！?？…・「」"
+# Whisper が同じ語句を延々と繰り返す暴走 (例: 結構結構結構…)。1〜20文字の語句が4回以上続いたら1回にまとめる
+_REPEAT_RE = re.compile(r"(.{1,20}?)(?:\s*\1){3,}", re.DOTALL)
+
+
+def collapse_repeats(text):
+    """同じ語句が4回以上続いている部分を1回にまとめる。数字だけの繰り返し (10000 など) はそのまま"""
+    def repl(m):
+        return m.group(0) if m.group(1).strip().isdigit() else m.group(1)
+    return _REPEAT_RE.sub(repl, text)
 
 
 def clean_transcription(result):
@@ -39,7 +49,7 @@ def clean_transcription(result):
         if text.strip(_PUNCTUATION) in HALLUCINATION_PHRASES:
             continue
         kept.append(text)
-    return "".join(kept).strip()
+    return collapse_repeats("".join(kept)).strip()
 
 def split_mic_virtual(data):
     """
@@ -71,7 +81,9 @@ class MlxWhisperModel:
         self.transcribe(np.zeros(TARGET_SR, dtype=np.float32))
 
     def transcribe(self, audio, language=None):
-        return self._mlx_whisper.transcribe(audio, path_or_hf_repo=self.repo, language=language)
+        # 前の区間の文章をヒントにすると、繰り返しの暴走が次の区間にも続きやすいので使わない
+        return self._mlx_whisper.transcribe(audio, path_or_hf_repo=self.repo, language=language,
+                                            condition_on_previous_text=False)
 
 
 def load_model():
@@ -104,6 +116,8 @@ class MojiOkoshi:
         self.thread = None
         self.stream = None
         self.is_running = False
+        self.is_paused = False  # pause() で録音だけ止めている (文字起こしは続く)
+        self.wav_paths = []     # この録音で保存した WAV (再開するたびに増える)
         self.current_scene = "default"
         self.scene_transcriptions = {}
         self.transcription_lock = threading.Lock()
@@ -229,7 +243,7 @@ class MojiOkoshi:
             print(f"処理完了 ({processed_index} / {total_queue})")
 
     def start(self):
-        if self.is_running:
+        if self.is_running or self.is_paused:
             print("⚠️ すでに録音中です。")
             return
 
@@ -240,7 +254,34 @@ class MojiOkoshi:
         with self.buffer_lock:
             self.partial_audio_buffer = []
         self.update_progress('idle', 0, 0)
+        self.wav_paths = []
+        self.last_wav_path = None
 
+        # --- 即時テキストログファイルの設定 (一時停止・再開しても同じファイルに書き続ける) ---
+        timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        try:
+            self.current_text_log_path = os.path.join(self.other_log_dir, timestamp_str + ".txt")
+            with open(self.current_text_log_path, "w", encoding="utf-8") as f:
+                f.write(f"--- 録音開始: {timestamp_str} ---\n")
+            print(f"即時ログを {self.current_text_log_path} に保存開始...")
+        except Exception as e:
+            print(f"即時ログファイルの作成に失敗しました: {e}")
+            self.current_text_log_path = None
+
+        # ストリームより先にワーカーを起動しておく
+        self.thread = threading.Thread(target=self.transcribe_worker, daemon=True)
+        self.thread.start()
+        try:
+            self._open_input()
+        except Exception:
+            self.audio_queue.put(None)
+            self.thread.join()
+            self.thread = None
+            self.current_text_log_path = None
+            raise
+
+    def _open_input(self):
+        """新しい WAV ファイルを作って録音ストリームを開始する (start と resume で使う)"""
         try:
             sd.default.device = SD_DEVICE
             sd.default.samplerate = SAMPLE_RATE # 48000
@@ -250,18 +291,17 @@ class MojiOkoshi:
             virtual_ch = channels - mic_ch
             print(f"入力: {SD_DEVICE} {channels}ch (マイク {mic_ch}ch + Mac の音 {virtual_ch}ch)")
 
-            now = datetime.datetime.now()
-            timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")
-
-            # --- WAVファイルの設定 (16kHz / 2ch) ---
+            # --- WAVファイルの設定 (16kHz / 2ch)。再開したときは別のファイルになる ---
             try:
-                wav_filename = timestamp_str + ".wav"
-                self.current_wav_path = os.path.join(self.voice_log_dir, wav_filename)
-                
-                # 保存するWAVファイルは 2 チャンネル、16kHz (TARGET_SR) で作成
+                timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                self.current_wav_path = os.path.join(self.voice_log_dir, timestamp_str + ".wav")
+                n = 1
+                while os.path.exists(self.current_wav_path):  # すぐ再開して同じ時刻になっても上書きしない
+                    self.current_wav_path = os.path.join(self.voice_log_dir, f"{timestamp_str}_{n}.wav")
+                    n += 1
                 self.wav_writer = sf.SoundFile(
-                    self.current_wav_path, 
-                    mode='w', 
+                    self.current_wav_path,
+                    mode='w',
                     samplerate=TARGET_SR, # 16000
                     channels=2            # 2チャンネル (Mic, Virtual Mono)
                 )
@@ -269,24 +309,9 @@ class MojiOkoshi:
             except Exception as e:
                 print(f"録音ファイルの作成に失敗しました: {e}")
                 self.wav_writer = None
-            
-            # --- 即時テキストログファイルの設定 ---
-            try:
-                text_filename = timestamp_str + ".txt"
-                self.current_text_log_path = os.path.join(self.other_log_dir, text_filename)
-                with open(self.current_text_log_path, "w", encoding="utf-8") as f:
-                    f.write(f"--- 録音開始: {timestamp_str} ---\n")
-                print(f"即時ログを {self.current_text_log_path} に保存開始...")
-            except Exception as e:
-                print(f"即時ログファイルの作成に失敗しました: {e}")
-                self.current_text_log_path = None
+                self.current_wav_path = None
 
             blocksize = int(RECORD_SEC * SAMPLE_RATE) # 48000Hz基準
-
-            # ストリームより先にワーカーを起動しておく
-            self.thread = threading.Thread(target=self.transcribe_worker, daemon=True)
-            self.thread.start()
-
             self.stream = sd.InputStream(callback=self.audio_callback, blocksize=blocksize)
             self.stream.start()
             self.is_running = True
@@ -299,26 +324,29 @@ class MojiOkoshi:
                 except Exception:
                     pass
                 self.stream = None
-            if self.thread is not None and self.thread.is_alive():
-                self.audio_queue.put(None)
-                self.thread.join()
-            self.thread = None
             if self.wav_writer:
                 self.wav_writer.close()
                 self.wav_writer = None
-            self.current_text_log_path = None
+            self.current_wav_path = None
             raise
 
-    def stop(self):
+    def _append_text_log(self, line):
+        if self.current_text_log_path:
+            try:
+                with open(self.current_text_log_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception as e:
+                print(f"即時ログファイルへの書き込みエラー: {e}")
+
+    def pause(self):
         """
-        録音を止め、残りの音声をすべて文字起こししてから戻る。
-        順番: ストリーム停止 → 残りの音声をキューへ → 終了の合図 (None) → ワーカー終了待ち
+        録音だけを止める。たまっている音声はキューに送り、文字起こしは裏で続ける。
+        resume() で録音に戻るか、stop() で残りを文字起こしして終える。
         """
         if not self.is_running:
-            print("⚠️ 録音していないので停止処理はスキップします。")
             return
         self.is_running = False
-        print("\n録音停止中...")
+        print("\n録音を一時停止中...")
 
         if self.stream is not None:
             try:
@@ -331,17 +359,50 @@ class MojiOkoshi:
         # ストリーム停止後に届いたコールバックは無視する
         self.stop_flag.set()
 
-        # 保存に成功したときだけ last_wav_path にパスを残す
-        self.last_wav_path = None
+        # 保存に成功したときだけ last_wav_path / wav_paths にパスを残す
         if self.wav_writer:
             try:
                 self.wav_writer.close()
                 self.last_wav_path = self.current_wav_path
+                self.wav_paths.append(self.current_wav_path)
                 print(f"WAVデータを {self.current_wav_path} に保存完了しました。")
             except Exception as e:
                 print(f"WAVファイルのクローズ中にエラーが発生しました: {e}")
             self.wav_writer = None
         self.current_wav_path = None
+
+        with self.buffer_lock:
+            if self.partial_audio_buffer:
+                print(f"残りの音声データ ({sum(data.shape[0] for data in self.partial_audio_buffer)}フレーム) をキューに追加します。")
+                self._flush_buffer_locked()
+
+        self.is_paused = True
+        self._append_text_log("--- 一時停止 ---\n")
+
+    def resume(self):
+        """一時停止から録音に戻る。WAV は新しいファイルになる。失敗したら一時停止のまま例外を出す。"""
+        if not self.is_paused:
+            return
+        self.stop_flag.clear()
+        try:
+            self._open_input()
+        except Exception:
+            self.stop_flag.set()
+            raise
+        self.is_paused = False
+        self._append_text_log("--- 再開 ---\n")
+
+    def stop(self):
+        """
+        録音を止め、残りの音声をすべて文字起こししてから戻る (一時停止中に呼んでもよい)。
+        順番: 一時停止 (ストリーム停止・残りの音声をキューへ) → 終了の合図 (None) → ワーカー終了待ち
+        """
+        if not self.is_running and not self.is_paused:
+            print("⚠️ 録音していないので停止処理はスキップします。")
+            return
+        print("\n録音停止中...")
+        self.pause()
+        self.is_paused = False
 
         # モデルが使えないときは、たまった音声を文字起こしせずに捨てる (WAV には残っている)
         self.last_stop_skipped = self.model is None
@@ -349,11 +410,6 @@ class MojiOkoshi:
             reason = f"モデル読み込みエラー: {self.model_error}" if self.model_error else "モデル読み込み前に停止"
             print(f"{reason}のため、文字起こしはスキップします。")
             self.skip_transcription.set()
-
-        with self.buffer_lock:
-            if self.partial_audio_buffer:
-                print(f"残りの音声データ ({sum(data.shape[0] for data in self.partial_audio_buffer)}フレーム) をキューに追加します。")
-                self._flush_buffer_locked()
 
         # 終了の合図は必ず残りの音声より後ろに入れる
         self.audio_queue.put(None)
@@ -364,12 +420,8 @@ class MojiOkoshi:
             self.thread = None
 
         if self.current_text_log_path:
-            try:
-                with open(self.current_text_log_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n--- 録音停止 ---\n")
-                print(f"即時ログを {self.current_text_log_path} に保存完了しました。")
-            except Exception as e:
-                print(f"即時ログファイルの後処理エラー: {e}")
+            self._append_text_log("\n--- 録音停止 ---\n")
+            print(f"即時ログを {self.current_text_log_path} に保存完了しました。")
             self.current_text_log_path = None
 
         self.update_progress('saving', self.processing_progress['total_items'], self.processing_progress['total_items'])
