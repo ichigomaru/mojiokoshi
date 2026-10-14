@@ -16,7 +16,7 @@ TARGET_SR = 16000         # Whisper用サンプルレート
 NUM_CHANNEL = None        # None なら録音開始時に SD_DEVICE の入力チャンネル数を自動で使う
 VIRTUAL_CHANNELS = 2      # SD_DEVICE (集約デバイス) の最後の何chが Mac の音 (BlackHole) か。残りはマイク
 VOLUME = 1.3
-MODEL_SIZE = "large"      # whisperモデルサイズ
+MODEL_REPO = "mlx-community/whisper-large-v3-mlx"  # mlx-whisper のモデル (Hugging Face)。初回だけダウンロードされる
 SD_DEVICE = "mojiokoshi"  # spot検索、オーディオデバイスの設定から変更可能
 LANGUAGE = "ja"           # Whisperの言語設定（例: "ja"、"en"）
 
@@ -58,6 +58,24 @@ def to_whisper_mono(data):
     """Whisper に渡すモノラル。全チャンネルの平均だと無音のチャンネルで声が小さくなるので、マイクと Mac の音を足す"""
     mic, virtual = split_mic_virtual(data)
     return np.clip(mic + virtual, -1.0, 1.0)
+
+
+class MlxWhisperModel:
+    """mlx-whisper (Apple Silicon の GPU) で文字起こしする"""
+
+    def __init__(self, repo):
+        import mlx_whisper  # MLX の読み込みも重いので、ここで import する
+        self._mlx_whisper = mlx_whisper
+        self.repo = repo
+        # mlx-whisper は最初の文字起こしでモデルを読み込むので、1秒の無音で一度動かしておく
+        self.transcribe(np.zeros(TARGET_SR, dtype=np.float32))
+
+    def transcribe(self, audio, language=None):
+        return self._mlx_whisper.transcribe(audio, path_or_hf_repo=self.repo, language=language)
+
+
+def load_model():
+    return MlxWhisperModel(MODEL_REPO)
 
 
 def detect_input_channels():
@@ -117,9 +135,8 @@ class MojiOkoshi:
 
     def _load_model(self):
         try:
-            print(f"Whisperモデル({MODEL_SIZE})を裏で読み込み中...")
-            import whisper  # PyTorch の読み込みも重いので、ここで import する
-            self.model = whisper.load_model(MODEL_SIZE)
+            print(f"Whisperモデル({MODEL_REPO})を裏で読み込み中...")
+            self.model = load_model()
             print("モデル読み込み完了")
         except Exception as e:
             self.model_error = str(e)
@@ -198,9 +215,7 @@ class MojiOkoshi:
                     resampled = np.clip(resampled * VOLUME, -1.0, 1.0)
 
                     # Whisperで文字起こし
-                    # FP16 は CUDA の GPU でしか使えない。CPU では FP32 を指定して警告を出さない
-                    use_fp16 = getattr(self.model, "device", None) is not None and self.model.device.type == "cuda"
-                    result = self.model.transcribe(resampled, language=LANGUAGE, fp16=use_fp16)
+                    result = self.model.transcribe(resampled, language=LANGUAGE)
                     text = clean_transcription(result)
                     print(text)
             except Exception as e:

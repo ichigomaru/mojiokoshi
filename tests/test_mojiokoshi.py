@@ -24,8 +24,7 @@ class FakeModel:
         self.max_active = 0
         self.lock = threading.Lock()
 
-    def transcribe(self, audio, language=None, fp16=True):
-        self.last_fp16 = fp16
+    def transcribe(self, audio, language=None):
         with self.lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -51,17 +50,16 @@ class FakeStream:
         pass
 
 
-fake_whisper = types.ModuleType("whisper")
-fake_whisper.load_model = lambda size: FakeModel()
 fake_sd = types.ModuleType("sounddevice")
 fake_sd.default = types.SimpleNamespace(device=None, samplerate=None, channels=None)
 fake_sd.InputStream = FakeStream
 FAKE_CHANNELS = {"n": 3}  # 偽の集約デバイスの入力チャンネル数
 fake_sd.query_devices = lambda device=None, kind=None: {"name": device, "max_input_channels": FAKE_CHANNELS["n"]}
-sys.modules["whisper"] = fake_whisper
 sys.modules["sounddevice"] = fake_sd
 
 import mojiokoshi  # noqa: E402
+
+mojiokoshi.load_model = lambda: FakeModel()
 
 SR = mojiokoshi.SAMPLE_RATE
 
@@ -100,7 +98,6 @@ class MojiOkoshiTest(unittest.TestCase):
         self.assertTrue(run_with_timeout(self.m.stop), "stop() が終わらない")
         self.assertEqual(self.m.scene_transcriptions["default"], ["3s", "2s"])
         self.assertIsNone(self.m.thread)
-        self.assertFalse(self.m.model.last_fp16, "CPU では fp16=False を渡す")
 
     def test_scene_switch_assigns_audio_to_recorded_scene(self):
         self.m.model = FakeModel(delay=0.3)  # ワーカーが処理中に切り替える
@@ -182,21 +179,21 @@ class BackgroundModelLoadTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         os.chdir(self._tmp.name)
         self.release = threading.Event()
-        self._orig_load = fake_whisper.load_model
+        self._orig_load = mojiokoshi.load_model
 
-        def slow_load(size):
+        def slow_load():
             self.release.wait(10)
             if getattr(self, "load_should_fail", False):
                 raise RuntimeError("読み込み失敗(テスト)")
             return FakeModel()
 
-        fake_whisper.load_model = slow_load
+        mojiokoshi.load_model = slow_load
         self.m = mojiokoshi.MojiOkoshi()
         self.m.buffer_target_size = 3 * SR
 
     def tearDown(self):
         self.release.set()
-        fake_whisper.load_model = self._orig_load
+        mojiokoshi.load_model = self._orig_load
         os.chdir(self._cwd)
         self._tmp.cleanup()
 
@@ -350,7 +347,7 @@ class HallucinationWorkerTest(unittest.TestCase):
             {"text": "ご視聴ありがとうございました", "segments": [seg("ご視聴ありがとうございました", 0.2)]},
             {"text": "本題です", "segments": [seg("本題です")]},
         ])
-        self.m.model = types.SimpleNamespace(transcribe=lambda audio, language=None, fp16=True: next(outputs))
+        self.m.model = types.SimpleNamespace(transcribe=lambda audio, language=None: next(outputs))
         self.m.buffer_target_size = SR
 
     def tearDown(self):
