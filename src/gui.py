@@ -687,7 +687,7 @@ class MojiOkoshiGUI:
                         progress["status"] = "Discord に送信中…"
                         # やり直しのときは送信済みのメッセージを飛ばす
                         fusetter.send_discord(webhook, posted, skip=progress["discord_sent"],
-                                              extra_lines=logs.edit_lines,
+                                              extra_lines=logs.discord_lines,
                                               on_sent=lambda n: progress.update(discord_sent=n))
                     else:
                         print("config.local.json に Discord の Webhook URL が無いので、Discord への送信はスキップします。")
@@ -742,6 +742,10 @@ class MojiOkoshiGUI:
                 action = self.show_message("発言まとめ", "発言まとめメーカーも使いますか?",
                                            buttons=(("あとで", "later"), ("使う", "use")))
                 if action == "use":
+                    try:
+                        session_log.launch_yokoku()
+                    except OSError as e:
+                        print(f"予告を起動できませんでした: {e}")
                     try:
                         session_log.launch_maker(logs.preferred_path())
                     except OSError as e:

@@ -3,17 +3,24 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 from urllib.parse import quote
 
 from fusetter import BODY_LIMIT, split_log
 
 HATSUGEN_PORT = 4477
+YOKOKU_PORT = 4479
 
 
 def edit_url(path):
     """保存済みログのファイル名から編集画面の URL を作る。"""
     return f'http://localhost:{HATSUGEN_PORT}/?log={quote(os.path.basename(path), safe="")}'
+
+
+def yokoku_url(path):
+    """保存済みログのファイル名から予告編集画面の URL を作る。"""
+    return f'http://localhost:{YOKOKU_PORT}/?log={quote(os.path.basename(path), safe="")}'
 
 
 def edit_line(path, secret=False, who=''):
@@ -181,6 +188,15 @@ class SegmentLogs:
             except Exception as e:
                 self.errors.append(f'ログ保存失敗: {e}')
 
+    @property
+    def discord_lines(self):
+        lines = []
+        for line, (secret, path) in zip(self.edit_lines, self.saved):
+            lines.append(line)
+            if not secret:
+                lines.append(f'予告(編集): {yokoku_url(path)}')
+        return lines
+
     def preferred_path(self):
         return next((p for secret, p in self.saved if not secret), self.saved[0][1] if self.saved else None)
 
@@ -197,3 +213,28 @@ def launch_maker(path):
         raise OSError(f'server.mjs が見つかりません: {directory}')
     subprocess.Popen([absolute_path(node), server, '--log', absolute_path(path)], cwd=directory,
                      start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def launch_yokoku():
+    """予告サーバーをブラウザを開かず起動する。起動済みなら何もしない。"""
+    try:
+        with socket.create_connection(('localhost', YOKOKU_PORT), timeout=0.2):
+            return
+    except OSError:
+        pass
+    directory = absolute_path(load_state().get('ccfolia_opening_dir') or '~/Developer/ccfolia-opening')
+    node = shutil.which('node')
+    if not node:
+        node = next((p for p in ('/usr/local/bin/node', '/opt/homebrew/bin/node') if os.access(p, os.X_OK)), None)
+    if not node:
+        raise OSError('node が見つかりません。')
+    server = os.path.join(directory, 'src', 'yokoku', 'server.mjs')
+    if not os.path.isfile(server):
+        raise OSError('予告の server.mjs が見つかりません。')
+    process = subprocess.Popen([absolute_path(node), server, '--no-open'], cwd=directory,
+                               start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        return
+    raise OSError('予告サーバーが終了しました。')
