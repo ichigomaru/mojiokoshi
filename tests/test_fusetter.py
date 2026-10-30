@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import fusetter  # noqa: E402
@@ -74,6 +75,32 @@ class ConfigTest(unittest.TestCase):
                 self.assertEqual(fusetter.load_webhook_url(), "https://example.invalid/home")
             finally:
                 fusetter.CONFIG_PATH, fusetter.HOME_CONFIG_PATH = orig
+
+
+class DiscordExtraLinesTest(unittest.TestCase):
+    def test_extra_lines_split_and_resume(self):
+        posts = [('題', 'u')]
+        extra = ['a' * 1993, '発言まとめ(編集): http://localhost:4477/?log=test.json']
+        messages = fusetter.discord_messages(posts, extra_lines=extra)
+        self.assertEqual(len(messages[0]), 1998)
+        self.assertEqual(messages, ['題\nu\n\n' + extra[0], extra[1]])
+        self.assertTrue(all(len(m) <= 2000 for m in messages))
+        response = MagicMock()
+        response.__enter__.return_value.status = 204
+        sent = []
+        with patch.object(fusetter.urllib.request, 'urlopen', return_value=response) as request:
+            fusetter.send_discord('https://example.invalid/hook', posts,
+                                  skip=1, on_sent=sent.append, extra_lines=extra)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(json.loads(request.call_args.args[0].data)['content'], extra[1])
+        self.assertEqual(sent, [2])
+
+    def test_empty_and_long_extra_lines(self):
+        posts = [('題', 'u')]
+        self.assertEqual(fusetter.discord_messages(posts, extra_lines=[]),
+                         fusetter.discord_messages(posts))
+        self.assertEqual(fusetter.discord_messages([], extra_lines=['x' * 4001]),
+                         ['x' * 2000, 'x' * 2000, 'x'])
 
 
 class DiscordTest(unittest.TestCase):

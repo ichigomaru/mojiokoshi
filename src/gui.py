@@ -10,6 +10,7 @@ import customtkinter as ctk
 from mojiokoshi import MojiOkoshi, LANGUAGE
 from scene_clock import SceneClock
 import fusetter
+import session_log
 
 # --- 見た目の設定 (ハードウェア風。配色が前提なのでライト固定) ---
 ctk.set_appearance_mode("light")
@@ -32,17 +33,7 @@ DISABLED = "#B9B6AE"
 GREEN = "#2F8F46"
 
 
-def _insert_newlines_ja(text):
-    """(from kaigyou.py) 文末記号の後に改行を入れる"""
-    sentence_terminators = ("。", "！", "？", ".", "!", "?")
-    new_text = ""
-    for char in text:
-        new_text += char
-        if char in sentence_terminators:
-            new_text += "\n"
-    # 特定の記号を削除
-    new_text = new_text.replace("[", "").replace("]", "").replace(",", "").replace(".", "").replace("'", "")
-    return new_text
+_insert_newlines_ja = session_log.insert_newlines_ja
 
 def _insert_newlines_en(text):
     """(from kaigyou_en.py) 文末記号の後に改行を入れる"""
@@ -425,6 +416,7 @@ class MojiOkoshiGUI:
             return
         if not self.history_rows:  # 最初のシーン名を入れずに始めたときも、時間を数えられるようにする
             self.add_scene_to_history(self.mojiokoshi.current_scene)
+        self.recording_date = datetime.date.today().isoformat()
         self.state = "recording"
         now = time.time()
         self.total_offset = self.scene_clock.total(now)
@@ -488,6 +480,17 @@ class MojiOkoshiGUI:
                              corner_radius=6, font=self.font_body, fg_color=KEY, border_color=KEY_BORDER,
                              border_width=1, text_color=INK, placeholder_text_color="#A09C93")
         entry.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18)
+        previous = session_log.load_state()
+        entry.configure(placeholder_text="シナリオ名")
+        entry.insert(0, previous.get("last_scenario", ""))
+        day_entry = ctk.CTkEntry(dialog, placeholder_text="何日目 (数字のみ)", height=38,
+                                 font=self.font_body, fg_color=KEY, border_color=KEY_BORDER,
+                                 text_color=INK)
+        entry.grid_configure(columnspan=1, padx=(18, 5))
+        day_entry.grid(row=2, column=1, sticky="ew", padx=(5, 18))
+        day_entry.configure(validate="key", validatecommand=(dialog.register(
+            lambda value: not value or (value.isascii() and value.isdigit())), "%P"))
+        day_entry.insert(0, previous.get("last_day", ""))
         post_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(dialog, text="ふせったーに投稿する", variable=post_var, font=self.font_body,
                         text_color=INK, fg_color=ORANGE, hover_color=ORANGE_HOVER, border_color=KEY_BORDER,
@@ -500,7 +503,13 @@ class MojiOkoshiGUI:
             if not title:
                 warning.configure(text="タイトルを入力してください")
                 return
-            result.update(action="finish", title=title, post=post_var.get())
+            self.scenario = title
+            self.day = day_entry.get().strip()
+            try:
+                session_log.save_state(self.scenario, self.day)
+            except OSError as e:
+                self.show_message("設定", f"前回の入力を保存できませんでした: {e}")
+            result.update(action="finish", title=session_log.base_title(title, self.day), post=post_var.get())
             dialog.destroy()
 
         self._key_button(dialog, "▶  再開", dialog.destroy).grid(
@@ -535,9 +544,6 @@ class MojiOkoshiGUI:
 
                 # 保存処理
                 self.mojiokoshi.save_all_scenes()
-                # After saving, ensure self.mojiokoshi.scenes is populated from scene_transcriptions
-                if hasattr(self.mojiokoshi, "scene_transcriptions"):
-                    self.mojiokoshi.scenes = dict(self.mojiokoshi.scene_transcriptions)
             except Exception as e:
                 print(f"エラーが発生しました: {e}")
                 stop_result["error"] = str(e)
@@ -573,25 +579,14 @@ class MojiOkoshiGUI:
     def save_scenario(self, final_title, post):
         """全シーンをまとめてタイトルのファイルに保存し、投稿するならふせったーへ、しないなら終了する"""
         try:
-            combined_text = ""
             scenes = getattr(self.mojiokoshi, "scenes", {})
-            if not isinstance(scenes, dict):
-                scenes = {}
-            for scene_name, text in scenes.items():
-                combined_text += f"【{scene_name}】\n{text}\n\n"
+            formatter = (_insert_newlines_ja if LANGUAGE == "ja" else
+                         _insert_newlines_en if LANGUAGE == "en" else lambda text: text)
+            formatted_text = session_log.scene_text(scenes, formatter=formatter)
 
-            # LANGUAGE定数に基づいて、適切な改行処理を適用します
-            if LANGUAGE == "ja":
-                formatted_text = _insert_newlines_ja(combined_text)
-            elif LANGUAGE == "en":
-                formatted_text = _insert_newlines_en(combined_text)
-            else:
-                # 'ja' 'en' 以外の場合は、デフォルトの結合テキストを使用
-                print(f"DEBUG: '{LANGUAGE}' に対応する改行フォーマットがありません。")
-                formatted_text = combined_text
-
-            os.makedirs("log/scenario_log", exist_ok=True)
-            filename = os.path.join("log", "scenario_log", f"{final_title}.txt")
+            directory = session_log.absolute_path("log/scenario_log")
+            os.makedirs(directory, exist_ok=True)
+            filename = os.path.join(directory, f"{final_title}.txt")
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(formatted_text)
             print(f"シナリオファイルを {filename} に保存しました。")
@@ -602,9 +597,51 @@ class MojiOkoshiGUI:
             return
 
         if post:
-            self.start_fusetter_post(final_title, formatted_text)
+            choices = self.ask_secret_scenes(scenes)
+            if choices is None:
+                self.quit_app()
+                return
+            try:
+                segments = session_log.build_segments(final_title, session_log.group_segments(scenes, choices), formatter)
+            except ValueError as e:
+                self.show_message("投稿", str(e))
+                self.reset_ui()
+                return
+            self.start_fusetter_post(final_title, formatted_text, segments)
         else:
             self.quit_app()
+
+    def ask_secret_scenes(self, scenes):
+        """文字起こしが終わってから、録音順に秘匿の指定を聞く。"""
+        dialog = ctk.CTkToplevel(self.root, fg_color=BODY)
+        dialog.title("投稿するシーン")
+        dialog.grid_columnconfigure((0, 1), weight=1)
+        frame = ctk.CTkScrollableFrame(dialog, width=540, height=300, fg_color=KEY)
+        frame.grid(row=0, column=0, columnspan=2, padx=18, pady=16)
+        rows = {}
+        result = {"choices": None}
+        for i, name in enumerate(scenes):
+            secret, who = session_log.secret_prefill(name)
+            ctk.CTkLabel(frame, text=name, font=self.font_body, text_color=INK).grid(
+                row=i, column=0, sticky="w", padx=5, pady=5)
+            variable = tk.BooleanVar(value=secret)
+            ctk.CTkCheckBox(frame, text="秘匿", variable=variable, width=70,
+                            font=self.font_body, fg_color=ORANGE).grid(row=i, column=1, padx=5)
+            entry = ctk.CTkEntry(frame, placeholder_text="誰のシーン", font=self.font_body)
+            entry.grid(row=i, column=2, padx=5)
+            entry.insert(0, who)
+            rows[name] = variable, entry
+
+        def confirm():
+            result["choices"] = {name: (v.get(), e.get()) for name, (v, e) in rows.items()}
+            dialog.destroy()
+
+        self._key_button(dialog, "キャンセル", dialog.destroy).grid(row=1, column=0, padx=18, pady=(0, 16))
+        button = self._key_button(dialog, "投稿する", confirm, primary=True)
+        button.grid(row=1, column=1, padx=18, pady=(0, 16))
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        self._run_modal(dialog, button)
+        return result["choices"]
 
     def quit_app(self):
         print("アプリを終了します。")
@@ -615,7 +652,7 @@ class MojiOkoshiGUI:
     # ------------------------------------------------------------------
     # ふせったーへの投稿
     # ------------------------------------------------------------------
-    def start_fusetter_post(self, title, log_text):
+    def start_fusetter_post(self, title, log_text, segments):
         """
         ふせったーに投稿し、Discord に URL を送ってから終了する。
         失敗したらやり直せる (投稿済みの分は飛ばす)。
@@ -624,23 +661,33 @@ class MojiOkoshiGUI:
         self.record_button.configure(state="disabled", text="…", fg_color=TRACK)
         self.update_switch_scene_button_state()
         self.update_record_status()
+        logs = session_log.SegmentLogs(self.scenario, self.day, self.recording_date, segments)
+        pairs = [pair for segment in segments for pair in segment['posts']]
         posted = []          # 投稿できた (タイトル, URL)。やり直しても消さない
         progress = {"status": "", "done": False, "error": None, "discord_done": False,
                     "discord_sent": 0, "no_webhook": False}
 
+        def on_posted(index, title, url):
+            posted.append((title, url))
+            logs.on_posted(index, title, url)
+
+        def report_log_errors():
+            if logs.errors:
+                self.show_message("発言まとめ", "\n".join(logs.errors))
+
         def run():
             progress.update(done=False, error=None)
             try:
-                fusetter.post_to_fusetter(
-                    title, log_text, start=len(posted),
-                    on_status=lambda text: progress.update(status=text),
-                    on_posted=lambda i, t, url: posted.append((t, url)))
+                fusetter.post_segments(
+                    pairs, start=len(posted),
+                    on_status=lambda text: progress.update(status=text), on_posted=on_posted)
                 if not progress["discord_done"]:
                     webhook = fusetter.load_webhook_url()
                     if webhook:
                         progress["status"] = "Discord に送信中…"
                         # やり直しのときは送信済みのメッセージを飛ばす
                         fusetter.send_discord(webhook, posted, skip=progress["discord_sent"],
+                                              extra_lines=logs.discord_lines,
                                               on_sent=lambda n: progress.update(discord_sent=n))
                     else:
                         print("config.local.json に Discord の Webhook URL が無いので、Discord への送信はスキップします。")
@@ -681,6 +728,7 @@ class MojiOkoshiGUI:
                 if retry:
                     start_thread()
                 else:
+                    report_log_errors()
                     self.quit_app()
                 return
             for t, url in posted:
@@ -689,6 +737,19 @@ class MojiOkoshiGUI:
                 self.show_message("Discord", "ふせったーには投稿しました。\n"
                                   "Discord の設定 (config.local.json の discord_webhook_url) が見つからないので、"
                                   "通知は送りませんでした。")
+            report_log_errors()
+            if logs.saved:
+                action = self.show_message("発言まとめ", "発言まとめメーカーも使いますか?",
+                                           buttons=(("あとで", "later"), ("使う", "use")))
+                if action == "use":
+                    try:
+                        session_log.launch_yokoku()
+                    except OSError as e:
+                        print(f"予告を起動できませんでした: {e}")
+                    try:
+                        session_log.launch_maker(logs.preferred_path())
+                    except OSError as e:
+                        self.show_message("発言まとめ", f"起動できませんでした: {e}")
             self.quit_app()
 
         start_thread()
