@@ -76,11 +76,19 @@ def load_webhook_url(path=None):
     return None
 
 
-def discord_messages(posts):
+def discord_messages(posts, extra_lines=()):
     """posts: [(タイトル, URL), ...] を Discord の 1メッセージ2000文字以内に分ける"""
     lines = [f"{t}\n{u or '(URL を取得できませんでした。ふせったーのマイページを確認してください)'}" for t, u in posts]
+    lines.extend(extra_lines)
     messages, current = [], ""
     for line in lines:
+        # 長いファイル名をエンコードした編集 URL も2000文字以内に収める。
+        while len(line) > 2000:
+            if current:
+                messages.append(current)
+                current = ""
+            messages.append(line[:2000])
+            line = line[2000:]
         if current and len(current) + len(line) + 2 > 2000:
             messages.append(current)
             current = ""
@@ -90,12 +98,12 @@ def discord_messages(posts):
     return messages
 
 
-def send_discord(webhook_url, posts, skip=0, on_sent=None):
+def send_discord(webhook_url, posts, skip=0, on_sent=None, extra_lines=()):
     """
     posts をまとめて Discord に送る。
     skip: 送信済みのメッセージ数 (やり直しで重複させないため)。on_sent(送った数) が1通ごとに呼ばれる。
     """
-    messages = discord_messages(posts)
+    messages = discord_messages(posts, extra_lines=extra_lines)
     for n, content in enumerate(messages[skip:], start=skip + 1):
         req = urllib.request.Request(
             webhook_url, data=json.dumps({"content": content}).encode("utf-8"),
@@ -410,10 +418,20 @@ def post_to_fusetter(title, log_text, start=0, dry_run=False, on_status=print, o
     on_posted(index, タイトル, URL): 1件投稿するたびに呼ばれる
     戻り値: [(タイトル, URL), ...] (今回投稿した分)
     """
-    chunks = split_log(log_text)
-    titles = post_titles(title, len(chunks))
-    if len(titles[-1]) > BODY_LIMIT:
-        raise FusetterError(f"タイトルが長すぎます (本文は{BODY_LIMIT}文字まで)。")
+    return post_segments([(t, c) for t, c in zip(post_titles(title, len(split_log(log_text))),
+                                                split_log(log_text))], start, on_status, on_posted, dry_run)
+
+
+def post_segments(segments, start=0, on_status=None, on_posted=None, dry_run=False):
+    """区間を分割して通し番号で投稿する。start は投稿済みの件数。"""
+    from session_log import flatten_segments
+    try:
+        flat = flatten_segments(segments)
+    except ValueError as e:
+        raise FusetterError(str(e)) from e
+    titles = [t for t, _ in flat]
+    chunks = [c for _, c in flat]
+    on_status = on_status or (lambda text: None)
 
     results = []
     for i in range(start, len(chunks)):
