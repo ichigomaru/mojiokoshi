@@ -602,7 +602,8 @@ class MojiOkoshiGUI:
                 self.quit_app()
                 return
             try:
-                segments = session_log.build_segments(final_title, session_log.group_segments(scenes, choices), formatter)
+                segments = session_log.build_segments(final_title, session_log.group_segments(
+                    scenes, choices, getattr(self.mojiokoshi, "scene_laugh_before", {})), formatter)
             except ValueError as e:
                 self.show_message("投稿", str(e))
                 self.reset_ui()

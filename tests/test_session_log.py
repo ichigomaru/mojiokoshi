@@ -93,7 +93,9 @@ class SessionLogTest(unittest.TestCase):
             path2 = log.save_log('物/語', '6', '2026-10-30', segments[0], ['url1'])
             self.assertTrue(path2.endswith('_2.json'))
             with open(path, encoding='utf-8') as f:
-                self.assertEqual(json.load(f), dict(scenario='物/語', day='6日目', date='2026-10-30',
+                content = json.load(f)
+                self.assertEqual(content.pop('laughBefore'), [])
+                self.assertEqual(content, dict(scenario='物/語', day='6日目', date='2026-10-30',
                     fusetterUrl='url1', fusetterUrls=['url1', 'url2'], secret=False, secretTitle='',
                     scenes=['A'], text='話。\n\n\n'))
             secret = log.save_log('会議', '', '2026-10-30', segments[1], ['secret'])
