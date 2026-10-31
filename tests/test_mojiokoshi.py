@@ -60,6 +60,7 @@ sys.modules["sounddevice"] = fake_sd
 import mojiokoshi  # noqa: E402
 
 mojiokoshi.load_model = lambda: FakeModel()
+mojiokoshi.LaughterDetector = lambda: types.SimpleNamespace(detect=lambda audio: [], prepare=lambda: None)
 
 SR = mojiokoshi.SAMPLE_RATE
 
@@ -483,6 +484,28 @@ class HallucinationWorkerTest(unittest.TestCase):
     def tearDown(self):
         os.chdir(self._cwd)
         self._tmp.cleanup()
+
+    def test_laughter_uses_mic_and_keeps_text_on_failure(self):
+        calls = []
+        self.m.model = types.SimpleNamespace(transcribe=lambda audio, language=None: {
+            "segments": [{"start": 0, "end": 1, "text": "発言"}]})
+        def detect(audio):
+            calls.append(audio.copy())
+            if len(calls) == 2:
+                raise RuntimeError("検出失敗")
+            return [(0, 4, .2)]
+        self.m.laughter_detector = types.SimpleNamespace(detect=detect, prepare=lambda: None)
+        self.m.start()
+        data = block()
+        data[:, 0] = 0
+        data[:, 1:] = .5
+        self.m.audio_callback(data, SR, None, None)
+        self.m.audio_callback(data, SR, None, None)
+        self.assertTrue(run_with_timeout(self.m.stop))
+        self.assertEqual(self.m.scene_transcriptions["default"], ["発言", "発言"])
+        self.assertEqual(self.m.scene_laugh_before, {"default": ["発言"]})
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(np.allclose(audio, 0) for audio in calls))
 
     def test_worker_skips_empty_text(self):
         self.m.start()

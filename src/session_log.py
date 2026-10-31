@@ -71,14 +71,16 @@ def scene_text(scenes, headers=True, formatter=insert_newlines_ja):
                              for name, text in scenes.items()))
 
 
-def group_segments(scenes, choices):
+def group_segments(scenes, choices, scene_laugh_before=None):
     """choices はシーン名 → (秘匿か, 誰のシーン)。共有は連続する範囲だけまとめる。"""
     segments = []
     for name, text in scenes.items():
         secret, who = choices.get(name, (False, ''))
         if secret or not segments or segments[-1]['secret']:
-            segments.append(dict(secret=secret, who=(who.strip() or name) if secret else '', scenes={}))
+            segments.append(dict(secret=secret, who=(who.strip() or name) if secret else '', scenes={}, laughBefore=[]))
         segments[-1]['scenes'][name] = text
+        before = segments[-1]['laughBefore']
+        before.extend(line for line in (scene_laugh_before or {}).get(name, []) if line not in before)
     return segments
 
 
@@ -148,7 +150,8 @@ def save_log(scenario, day, date, segment, urls):
     name = log_file_stem(base_title(scenario, day), segment['who'] if segment['secret'] else None, date)
     content = dict(scenario=scenario, day=f'{day}日目' if day else '', date=date,
                    fusetterUrl=urls[0], fusetterUrls=urls, secret=segment['secret'],
-                   secretTitle=segment['who'], scenes=list(segment['scenes']), text=segment['plain_text'])
+                   secretTitle=segment['who'], scenes=list(segment['scenes']), text=segment['plain_text'],
+                   laughBefore=segment.get('laughBefore', []))
     number = 1
     while True:
         path = os.path.join(directory, name + (f'_{number}' if number > 1 else '') + '.json')

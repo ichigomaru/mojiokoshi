@@ -9,6 +9,9 @@ import datetime
 import soundfile as sf 
 
 
+from laughter import LaughterDetector, laugh_before, HALLUCINATION_PHRASES, _PUNCTUATION
+
+
 # ----- 設定項目 -----
 RECORD_SEC = 1            # 1秒ごとの分割録音 (シーン切り替え・停止の区切り精度)
 BUFFER_SEC = 60           # 60秒分貯まったらキューに送る
@@ -21,9 +24,6 @@ MODEL_REPO = "mlx-community/whisper-large-v3-mlx"  # mlx-whisper のモデル (H
 SD_DEVICE = "mojiokoshi"  # spot検索、オーディオデバイスの設定から変更可能
 LANGUAGE = "ja"           # Whisperの言語設定（例: "ja"、"en"）
 
-# 無音のときに Whisper が書き出しがちな幻の文。区間のテキストがこれだけなら消す (必要に応じて追加)
-HALLUCINATION_PHRASES = ("ご視聴ありがとうございました",)
-_PUNCTUATION = " 　。、．，.,!！?？…・「」"
 # Whisper が同じ語句を延々と繰り返す暴走 (例: 結構結構結構…)。1〜20文字の語句が4回以上続いたら1回にまとめる
 _REPEAT_RE = re.compile(r"(.{1,20}?)(?:\s*\1){3,}", re.DOTALL)
 
@@ -120,6 +120,8 @@ class MojiOkoshi:
         self.wav_paths = []     # この録音で保存した WAV (再開するたびに増える)
         self.current_scene = "default"
         self.scene_transcriptions = {}
+        self.scene_laugh_before = {}
+        self.laughter_detector = LaughterDetector()
         self.transcription_lock = threading.Lock()
         # partial_audio_buffer と current_scene を録音コールバックと他スレッドで共有するためのロック
         self.buffer_lock = threading.Lock()
@@ -152,6 +154,10 @@ class MojiOkoshi:
             print(f"Whisperモデル({MODEL_REPO})を裏で読み込み中...")
             self.model = load_model()
             print("モデル読み込み完了")
+            try:
+                self.laughter_detector.prepare()
+            except Exception as e:
+                print(f"笑い検出モデルの準備に失敗しました: {e}")
         except Exception as e:
             self.model_error = str(e)
             print(f"モデル読み込みエラー: {e}")
@@ -217,6 +223,7 @@ class MojiOkoshi:
             total_queue = processed_index + self.audio_queue.qsize()
             self.update_progress('transcribing', processed_index - 1, total_queue)
             print(f"処理開始 ({processed_index} / {total_queue}) [シーン: {scene_name}]")
+            result = None
             try:
                 # モノラル化 (マイク + Mac の音)
                 mono = to_whisper_mono(data)
@@ -239,6 +246,17 @@ class MojiOkoshi:
             if text:  # 無音などで何も残らなかったら追加しない
                 self.text_results.append(text)
                 self.add_transcription(text, scene_name)
+            if result is not None and result.get("segments"):
+                try:
+                    mic, _ = split_mic_virtual(data)
+                    mic16k = librosa.resample(mic, orig_sr=SAMPLE_RATE, target_sr=TARGET_SR)
+                    laughs = self.laughter_detector.detect(mic16k)
+                    before = laugh_before(result["segments"], laughs)
+                    with self.transcription_lock:
+                        saved = self.scene_laugh_before.setdefault(scene_name, [])
+                        saved.extend(line for line in before if line not in saved)
+                except Exception as e:
+                    print(f"笑い検出エラー: {e}")
             self.update_progress('transcribing', processed_index, processed_index + self.audio_queue.qsize())
             print(f"処理完了 ({processed_index} / {total_queue})")
 
