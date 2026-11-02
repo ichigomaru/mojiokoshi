@@ -76,34 +76,45 @@ def load_webhook_url(path=None):
     return None
 
 
-def discord_messages(posts, extra_lines=()):
-    """posts: [(タイトル, URL), ...] を Discord の 1メッセージ2000文字以内に分ける"""
+def discord_messages(posts, extra_lines=(), sizes=None):
+    """
+    posts: [(タイトル, URL), ...] を Discord の 1メッセージ2000文字以内に分ける。
+    sizes: posts を何件ずつ別のメッセージにするか (区間ごと)。省略すると posts は1つにまとめる。
+    extra_lines (編集 URL など) は posts とは別のメッセージにする。
+    """
     lines = [f"{t}\n{u or '(URL を取得できませんでした。ふせったーのマイページを確認してください)'}" for t, u in posts]
-    lines.extend(extra_lines)
-    messages, current = [], ""
-    for line in lines:
-        # 長いファイル名をエンコードした編集 URL も2000文字以内に収める。
-        while len(line) > 2000:
-            if current:
+    groups, start = [], 0
+    for size in (sizes if sizes is not None else [len(lines)]):
+        groups.append(lines[start:start + size])
+        start += size
+    groups.append(lines[start:])  # sizes の合計より多い分
+    groups.append(list(extra_lines))
+    messages = []
+    for group in groups:
+        current = ""
+        for line in group:
+            # 長いファイル名をエンコードした編集 URL も2000文字以内に収める。
+            while len(line) > 2000:
+                if current:
+                    messages.append(current)
+                    current = ""
+                messages.append(line[:2000])
+                line = line[2000:]
+            if current and len(current) + len(line) + 2 > 2000:
                 messages.append(current)
                 current = ""
-            messages.append(line[:2000])
-            line = line[2000:]
-        if current and len(current) + len(line) + 2 > 2000:
+            current = f"{current}\n\n{line}" if current else line
+        if current:
             messages.append(current)
-            current = ""
-        current = f"{current}\n\n{line}" if current else line
-    if current:
-        messages.append(current)
     return messages
 
 
-def send_discord(webhook_url, posts, skip=0, on_sent=None, extra_lines=()):
+def send_discord(webhook_url, posts, skip=0, on_sent=None, extra_lines=(), sizes=None):
     """
-    posts をまとめて Discord に送る。
+    posts を Discord に送る (sizes で区間ごとに別のメッセージにする)。
     skip: 送信済みのメッセージ数 (やり直しで重複させないため)。on_sent(送った数) が1通ごとに呼ばれる。
     """
-    messages = discord_messages(posts, extra_lines=extra_lines)
+    messages = discord_messages(posts, extra_lines=extra_lines, sizes=sizes)
     for n, content in enumerate(messages[skip:], start=skip + 1):
         req = urllib.request.Request(
             webhook_url, data=json.dumps({"content": content}).encode("utf-8"),

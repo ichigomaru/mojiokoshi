@@ -476,39 +476,65 @@ class MojiOkoshiGUI:
         ctk.CTkLabel(dialog, text="文字起こしは裏で続いています。終了するならタイトルを入力してください。",
                      font=self.font_tag, text_color=MUTED).grid(
             row=1, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 8))
-        entry = ctk.CTkEntry(dialog, placeholder_text="例: 2026-10-05 打ち合わせ", width=320, height=38,
+        checkbox_style = dict(font=self.font_body, text_color=INK, fg_color=ORANGE, hover_color=ORANGE_HOVER,
+                              border_color=KEY_BORDER, corner_radius=4)
+        # シナリオにすると「シナリオ名_N日目」のタイトルになる
+        checkbox_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        checkbox_frame.grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 8))
+        scenario_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(checkbox_frame, text="シナリオ", variable=scenario_var, command=lambda: show_scenario_inputs(),
+                        **checkbox_style).grid(row=0, column=0, sticky="w", padx=(0, 16))
+        # 入力欄は1つの枠に入れる (ボタンの列に合わせると「何日目」が横に広がって画面が倍の幅になる)
+        input_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        input_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=18)
+        input_frame.grid_columnconfigure(0, weight=1)
+        entry = ctk.CTkEntry(input_frame, placeholder_text="タイトル", width=320, height=38,
                              corner_radius=6, font=self.font_body, fg_color=KEY, border_color=KEY_BORDER,
                              border_width=1, text_color=INK, placeholder_text_color="#A09C93")
-        entry.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18)
-        previous = session_log.load_state()
-        entry.configure(placeholder_text="シナリオ名")
-        entry.insert(0, previous.get("last_scenario", ""))
-        day_entry = ctk.CTkEntry(dialog, placeholder_text="何日目 (数字のみ)", height=38,
+        entry.grid(row=0, column=0, sticky="ew")
+        day_entry = ctk.CTkEntry(input_frame, placeholder_text="何日目", width=90, height=38,
                                  font=self.font_body, fg_color=KEY, border_color=KEY_BORDER,
                                  text_color=INK)
-        entry.grid_configure(columnspan=1, padx=(18, 5))
-        day_entry.grid(row=2, column=1, sticky="ew", padx=(5, 18))
         day_entry.configure(validate="key", validatecommand=(dialog.register(
             lambda value: not value or (value.isascii() and value.isdigit())), "%P"))
-        day_entry.insert(0, previous.get("last_day", ""))
         post_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(dialog, text="ふせったーに投稿する", variable=post_var, font=self.font_body,
-                        text_color=INK, fg_color=ORANGE, hover_color=ORANGE_HOVER, border_color=KEY_BORDER,
-                        corner_radius=4).grid(row=3, column=0, columnspan=2, sticky="w", padx=18, pady=(10, 0))
+        ctk.CTkCheckBox(checkbox_frame, text="ふせったーに投稿する", variable=post_var, **checkbox_style).grid(
+            row=0, column=1, sticky="w")
         warning = ctk.CTkLabel(dialog, text="", font=self.font_tag, text_color=ORANGE, height=16)
         warning.grid(row=4, column=0, columnspan=2, sticky="w", padx=18)
 
+        def show_scenario_inputs():
+            """シナリオなら シナリオ名 + 何日目 (前回の値を入れる)、違うならタイトル1つにする"""
+            warning.configure(text="")
+            if scenario_var.get():
+                previous = session_log.load_state()
+                if not entry.get().strip():
+                    entry.delete(0, tk.END)
+                    entry.insert(0, previous.get("last_scenario", ""))
+                if not day_entry.get().strip():
+                    day_entry.insert(0, previous.get("last_day", ""))
+                entry.configure(placeholder_text="シナリオ名")
+                day_entry.grid(row=0, column=1, padx=(8, 0))
+            else:
+                entry.configure(placeholder_text="タイトル")
+                day_entry.grid_remove()
+
         def on_finish():
             title = entry.get().strip()
+            day = day_entry.get().strip() if scenario_var.get() else ""
             if not title:
-                warning.configure(text="タイトルを入力してください")
+                warning.configure(text="シナリオ名を入力してください" if scenario_var.get() else "タイトルを入力してください")
+                return
+            if scenario_var.get() and not day:
+                warning.configure(text="何日目を入力してください")
                 return
             self.scenario = title
-            self.day = day_entry.get().strip()
-            try:
-                session_log.save_state(self.scenario, self.day)
-            except OSError as e:
-                self.show_message("設定", f"前回の入力を保存できませんでした: {e}")
+            self.day = day
+            if scenario_var.get():
+                try:
+                    session_log.save_state(self.scenario, self.day)
+                except OSError as e:
+                    self.show_message("設定", f"前回の入力を保存できませんでした: {e}")
             result.update(action="finish", title=session_log.base_title(title, self.day), post=post_var.get())
             dialog.destroy()
 
@@ -517,6 +543,7 @@ class MojiOkoshiGUI:
         self._key_button(dialog, "保存して終了", on_finish, primary=True).grid(
             row=5, column=1, sticky="ew", padx=(5, 18), pady=(2, 16))
         entry.bind("<Return>", lambda e: on_finish())
+        day_entry.bind("<Return>", lambda e: on_finish())
         dialog.bind("<Escape>", lambda e: dialog.destroy())
 
         self._run_modal(dialog, entry)
@@ -686,9 +713,11 @@ class MojiOkoshiGUI:
                     webhook = fusetter.load_webhook_url()
                     if webhook:
                         progress["status"] = "Discord に送信中…"
+                        # 秘匿・本編のログは区間ごと、編集 URL はまとめて別のメッセージにする。
                         # やり直しのときは送信済みのメッセージを飛ばす
                         fusetter.send_discord(webhook, posted, skip=progress["discord_sent"],
                                               extra_lines=logs.discord_lines,
+                                              sizes=[len(segment['posts']) for segment in segments],
                                               on_sent=lambda n: progress.update(discord_sent=n))
                     else:
                         print("config.local.json に Discord の Webhook URL が無いので、Discord への送信はスキップします。")

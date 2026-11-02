@@ -80,20 +80,31 @@ class ConfigTest(unittest.TestCase):
 class DiscordExtraLinesTest(unittest.TestCase):
     def test_extra_lines_split_and_resume(self):
         posts = [('題', 'u')]
-        extra = ['a' * 1993, '発言まとめ(編集): http://localhost:4477/?log=test.json']
+        extra = ['a' * 1998, '発言まとめ(編集): http://localhost:4477/?log=test.json']
         messages = fusetter.discord_messages(posts, extra_lines=extra)
-        self.assertEqual(len(messages[0]), 1998)
-        self.assertEqual(messages, ['題\nu\n\n' + extra[0], extra[1]])
+        # ログと編集 URL は別のメッセージ。編集 URL どうしは2000文字を超えるときだけ分ける
+        self.assertEqual(messages, ['題\nu', extra[0], extra[1]])
         self.assertTrue(all(len(m) <= 2000 for m in messages))
         response = MagicMock()
         response.__enter__.return_value.status = 204
         sent = []
         with patch.object(fusetter.urllib.request, 'urlopen', return_value=response) as request:
             fusetter.send_discord('https://example.invalid/hook', posts,
-                                  skip=1, on_sent=sent.append, extra_lines=extra)
+                                  skip=2, on_sent=sent.append, extra_lines=extra)
         self.assertEqual(request.call_count, 1)
         self.assertEqual(json.loads(request.call_args.args[0].data)['content'], extra[1])
-        self.assertEqual(sent, [2])
+        self.assertEqual(sent, [3])
+
+    def test_segments_and_edit_urls_are_separate_messages(self):
+        posts = [('灰と甘露7日目秘匿「HO禍」ログ', 'https://fse.tw/a'),
+                 ('灰と甘露7日目秘匿「HO祈」ログ', 'https://fse.tw/b'),
+                 ('灰と甘露7日目ログ', 'https://fse.tw/c'), ('灰と甘露7日目ログ2', 'https://fse.tw/d')]
+        extra = ['発言まとめ(編集): x', '予告(編集): y']
+        self.assertEqual(fusetter.discord_messages(posts, extra_lines=extra, sizes=[1, 1, 2]), [
+            '灰と甘露7日目秘匿「HO禍」ログ\nhttps://fse.tw/a',
+            '灰と甘露7日目秘匿「HO祈」ログ\nhttps://fse.tw/b',
+            '灰と甘露7日目ログ\nhttps://fse.tw/c\n\n灰と甘露7日目ログ2\nhttps://fse.tw/d',
+            '発言まとめ(編集): x\n\n予告(編集): y'])
 
     def test_empty_and_long_extra_lines(self):
         posts = [('題', 'u')]
