@@ -1,4 +1,5 @@
 import sounddevice as sd
+from audio_device import create_aggregate_device
 import numpy as np
 import librosa
 import threading
@@ -21,6 +22,9 @@ NUM_CHANNEL = None        # None なら録音開始時に SD_DEVICE の入力チ
 VIRTUAL_CHANNELS = 2      # SD_DEVICE (集約デバイス) の最後の何chが Mac の音 (BlackHole) か。残りはマイク
 VOLUME = 1.3
 MODEL_REPO = "mlx-community/whisper-large-v3-mlx"  # mlx-whisper のモデル (Hugging Face)。初回だけダウンロードされる
+USB_MIC_NAME = "UGREEN USB MIC-CM769"
+BUILTIN_MIC_NAME = "MacBook Airのマイク"
+BLACKHOLE_NAME = "BlackHole 2ch"
 SD_DEVICE = "mojiokoshi"  # spot検索、オーディオデバイスの設定から変更可能
 LANGUAGE = "ja"           # Whisperの言語設定（例: "ja"、"en"）
 
@@ -115,6 +119,8 @@ class MojiOkoshi:
         self.stop_flag = threading.Event()
         self.thread = None
         self.stream = None
+        self.aggregate_device = None
+        self.mic_kind = None
         self.is_running = False
         self.is_paused = False  # pause() で録音だけ止めている (文字起こしは続く)
         self.wav_paths = []     # この録音で保存した WAV (再開するたびに増える)
@@ -301,13 +307,23 @@ class MojiOkoshi:
     def _open_input(self):
         """新しい WAV ファイルを作って録音ストリームを開始する (start と resume で使う)"""
         try:
-            sd.default.device = SD_DEVICE
+            self.mic_kind = None
+            try:
+                self.aggregate_device = create_aggregate_device(
+                    sd, USB_MIC_NAME, BUILTIN_MIC_NAME, BLACKHOLE_NAME)
+                device = self.aggregate_device.input_index
+                channels = self.aggregate_device.channels
+                self.mic_kind = self.aggregate_device.mic_kind
+            except Exception as e:
+                print(f"マイクの自動設定に失敗しました。従来の {SD_DEVICE} を使います: {e}")
+                device = SD_DEVICE
+                channels = detect_input_channels()
+            sd.default.device = device
             sd.default.samplerate = SAMPLE_RATE # 48000
-            channels = detect_input_channels()
             sd.default.channels = channels
             mic_ch = channels - VIRTUAL_CHANNELS if channels > VIRTUAL_CHANNELS else channels
             virtual_ch = channels - mic_ch
-            print(f"入力: {SD_DEVICE} {channels}ch (マイク {mic_ch}ch + Mac の音 {virtual_ch}ch)")
+            print(f"入力: {self.mic_kind or SD_DEVICE} {channels}ch (マイク {mic_ch}ch + Mac の音 {virtual_ch}ch)")
 
             # --- WAVファイルの設定 (16kHz / 2ch)。再開したときは別のファイルになる ---
             try:
@@ -342,11 +358,21 @@ class MojiOkoshi:
                 except Exception:
                     pass
                 self.stream = None
+            self._destroy_aggregate()
             if self.wav_writer:
                 self.wav_writer.close()
                 self.wav_writer = None
             self.current_wav_path = None
             raise
+
+    def _destroy_aggregate(self):
+        self.mic_kind = None
+        if self.aggregate_device is not None:
+            try:
+                self.aggregate_device.destroy()
+                self.aggregate_device = None
+            except Exception as e:
+                print(f"集約デバイスの破棄に失敗しました: {e}")
 
     def _append_text_log(self, line):
         if self.current_text_log_path:
@@ -368,12 +394,15 @@ class MojiOkoshi:
 
         if self.stream is not None:
             try:
-                self.stream.stop()
-                self.stream.close()
+                try:
+                    self.stream.stop()
+                finally:
+                    self.stream.close()
                 print("録音ストリームを停止しました。")
             except Exception as e:
                 print(f"録音ストリームの停止中にエラーが発生しました: {e}")
             self.stream = None
+        self._destroy_aggregate()
         # ストリーム停止後に届いたコールバックは無視する
         self.stop_flag.set()
 

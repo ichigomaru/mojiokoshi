@@ -422,7 +422,7 @@ class MojiOkoshiGUI:
         self.total_offset = self.scene_clock.total(now)
         self.scene_clock.start(now)
         self.record_button.configure(text="■  STOP", fg_color=INK, hover_color=INK_HOVER)
-        self._set_status("")
+        self._set_status(getattr(self.mojiokoshi, "mic_kind", None) or "")
         self.update_record_status()
 
     def stop_recording(self):
@@ -455,7 +455,7 @@ class MojiOkoshiGUI:
             self.state = "recording"
             self.scene_clock.start(time.time())
             self.record_button.configure(state="normal", text="■  STOP", fg_color=INK, hover_color=INK_HOVER)
-            self._set_status("")
+            self._set_status(getattr(self.mojiokoshi, "mic_kind", None) or "")
             self.update_switch_scene_button_state()
             self.update_record_status()
             return
